@@ -7,141 +7,58 @@
 #include <string.h>
 
 #include "unixtime.h"
+#include "i2c.h"
 
-#define I2C1_CTLR1_DEFAULT (I2C_CTLR1_PE | I2C_CTLR1_ACK)
-#define I2C1_CTLR2_DEFAULT (I2C_CTLR2_ITBUFEN | I2C_CTLR2_ITEVTEN | I2C_CTLR2_ITERREN)
+// push and pull data
 
-volatile uint32_t time = 0;
-volatile bool last_valid_timestamp = false;
+// timestamp data
+volatile bool timestamp_valid;
+volatile uint32_t timestamp_value;
+volatile uint32_t timestamp_tick;
 
-volatile struct {
-    uint32_t timestamp;
-    uint8_t valid;
-} txdata;
+// auxiliary data
+volatile int32_t latitude;
+volatile int32_t longitude;
+volatile uint8_t n_satellites;
 
-volatile uint8_t* txbuf = (uint8_t*)&txdata;
+void update_timestamp(bool valid, int Y, int M, int D, int h, int m, int s) {
+    uint32_t value = unix_from_utc(Y,M,D,h,m,s);
+    __disable_irq();
+    timestamp_tick = SysTick->CNT;
+    timestamp_valid = valid;
+    timestamp_value = value;
+    __enable_irq();
+}
 
-volatile uint32_t idx = 0;
-
-// #define TRACING
-
-void I2C1_EV_IRQHandler(void) __attribute__((interrupt));
-void I2C1_EV_IRQHandler(void) {
-    uint32_t s1 = I2C1->STAR1;
-    uint32_t s2 = I2C1->STAR2;
-    
-#ifdef TRACING
-    if (s2 & I2C_STAR2_MSL) {
-        printf("We're a master.\n");
-    } else {
-        printf("We're a slave.\n");
-    }
-
-    if (s2 & I2C_STAR2_TRA) {
-        printf("We're transmitting.\n");
-    } else {
-        printf("We're receiving\n");
-    }
-#endif
-
-    if (s1 & I2C_STAR1_SB) {
-#ifdef TRACING
-        printf("Start bit sent\n");
-#endif
-        I2C1->DATAR = 0x10;
-    }
-
-    if (s1 & I2C_STAR1_ADDR) {
-        idx = 0;
-#ifdef TRACING
-        printf("Address matched\n");
-#endif
-    }
-
-    if (s1 & I2C_STAR1_RXNE) {
-        (void)I2C1->DATAR;
-#ifdef TRACING
-        printf("Got byte\n");
-#endif
-    }
-
-    if (s1 & I2C_STAR1_TXE) {
-#ifdef TRACING
-        printf("New byte requested\n");
-#endif
-        if (idx == 0) {
-            txdata.timestamp = time;
-            txdata.valid = last_valid_timestamp?1:0;
-        }
-
-        if (s2 & I2C_STAR2_MSL) {
-            if (idx == 5) {
-                I2C1->CTLR1 = I2C1_CTLR1_DEFAULT | I2C_CTLR1_STOP;
-#ifdef TRACING
-                printf("All sent. Requesting stop\n");
-#endif
-            } else {
-                I2C1->DATAR = txbuf[idx];
-                idx++;
-            }
-        } else {
-            I2C1->DATAR = txbuf[idx];
-            idx = (idx + 1) % 5;
-        }
-    }
-
-    if (s1 & I2C_STAR1_STOPF) {
-#ifdef TRACING
-        printf("Stop condition\n");
-#endif
-        idx = 0;
-        I2C1->CTLR1 = I2C1_CTLR1_DEFAULT;
+void poll_timestamp() {
+    const uint32_t timeout = FUNCONF_SYSTEM_CORE_CLOCK/8;
+    if (SysTick->CNT - timestamp_tick > timeout) {
+        timestamp_valid = false;
     }
 }
 
-void I2C1_ER_IRQHandler(void) __attribute__((interrupt));
-void I2C1_ER_IRQHandler(void) {
-    uint32_t s1 = I2C1->STAR1;
-    uint32_t s2 = I2C1->STAR2;
+void update_auxiliary(int32_t lat, int32_t lon, uint8_t nsat) {
+    __disable_irq();
+    latitude = lat;
+    longitude = lon;
+    n_satellites = nsat;
+    __enable_irq();
+}
 
-    if (s1 & I2C_STAR1_PECERR) {
-#ifdef TRACING
-        printf("PEC error\n");
-#endif
-        I2C1->STAR1 = s1 & (~I2C_STAR1_PECERR);
-    }
-    if (s1 & I2C_STAR1_OVR) {
-#ifdef TRACING
-        printf("Overrun error\n");
-#endif
-        I2C1->STAR1 = s1 & (~I2C_STAR1_OVR);
-    }
-    if (s1 & I2C_STAR1_AF) {
-        if (s2 & I2C_STAR2_MSL) {
-#ifdef TRACING
-            printf("Not acknowledge. Stopping\n");
-#endif
-            I2C1->CTLR1 = I2C1_CTLR1_DEFAULT | I2C_CTLR1_STOP;
-            I2C1->STAR1 = s1 & (~I2C_STAR1_AF);
-        } else {
-#ifdef TRACING
-            printf("Last byte. Stop.\n");
-#endif
-            I2C1->STAR1 = s1 & (~I2C_STAR1_AF);
-        }
-    }
-    if (s1 & I2C_STAR1_ARLO) {
-#ifdef TRACING
-        printf("Arbitration lost\n");
-#endif
-        I2C1->STAR1 = s1 & (~I2C_STAR1_ARLO);
-    }
-    if (s1 & I2C_STAR1_BERR) {
-#ifdef TRACING
-        printf("Bus error\n");
-#endif
-        I2C1->STAR1 = s1 & (~I2C_STAR1_BERR);
-    }
+// packed struct when pulling data
+struct __attribute__((packed)) {
+    uint32_t timestamp; // unix time of fix.
+    int32_t lat; // fraction of 360 degrees in Q0.31 format. North is positive.
+    int32_t lon; // fraction of 360 degrees in Q0.31 format. East is positive.
+    uint8_t nsat_valid; // bit 7: validity, bits [6:0] number of satellites
+} pull_data_buf;
+
+// called when request to pull data is received
+void update_tx_callback() {
+    pull_data_buf.timestamp = timestamp_value;
+    pull_data_buf.lat = latitude;
+    pull_data_buf.lon = longitude;
+    pull_data_buf.nsat_valid = n_satellites | (timestamp_valid?0x80:0x00);
 }
 
 void UART_bitbang(uint8_t ch) {
@@ -156,6 +73,13 @@ void UART_bitbang(uint8_t ch) {
 void UART_put(char* str, size_t len) {
     for(size_t i=0;i<len;i++) {
         UART_bitbang(str[i]);
+    }
+}
+
+void UART_puts(char* str) {
+    while(*str) {
+        UART_bitbang(*str);
+        str++;
     }
 }
 
@@ -180,6 +104,10 @@ uint8_t decpair_to_value(char* dec) {
     return digitvalue(dec[0])*10 + digitvalue(dec[1]);
 }
 
+uint8_t dectriple_to_value(char* dec) {
+    return digitvalue(dec[0])*100 + digitvalue(dec[1])*10 + digitvalue(dec[2]);
+}
+
 int main() {
     SystemInit();
 
@@ -195,27 +123,13 @@ int main() {
     GPIOC->CFGLR &= ~(0xf << (4*6));
     GPIOC->CFGLR |= (GPIO_Speed_In | GPIO_CNF_IN_FLOATING) << (4*6);
 
-    // PC1, PC4: I2C pins
-    GPIOC->CFGLR &= ~(0xf << (4*2));
-    GPIOC->CFGLR |= (GPIO_Speed_2MHz | GPIO_CNF_OUT_OD_AF) << (4*2);
-    GPIOC->CFGLR &= ~(0xf << (4*1));
-    GPIOC->CFGLR |= (GPIO_Speed_2MHz | GPIO_CNF_OUT_OD_AF) << (4*1);
-
-    NVIC_EnableIRQ(I2C1_EV_IRQn); // Event interrupt
-    NVIC_SetPriority(I2C1_EV_IRQn, 0);
-    NVIC_EnableIRQ(I2C1_ER_IRQn); // Error interrupt
-    NVIC_SetPriority(I2C1_ER_IRQn, 0);
-
-    I2C1->CKCFGR = FUNCONF_SYSTEM_CORE_CLOCK / (2*100000UL);
-    I2C1->CTLR2 = FUNCONF_SYSTEM_CORE_CLOCK / 1000000UL;
-    I2C1->OADDR1 = 0x0e;
-    I2C1->CTLR1 = I2C1_CTLR1_DEFAULT;
-    I2C1->CTLR2 = I2C1_CTLR2_DEFAULT;
+    i2c_init(0x03, 100000UL);
+    i2c_set_slave_tx(&pull_data_buf, sizeof(pull_data_buf), update_tx_callback);
 
     USART1->CTLR1 = USART_WordLength_8b | USART_Parity_No | USART_Mode_Rx;
     USART1->CTLR2 = USART_StopBits_1;
     USART1->CTLR3 = USART_HardwareFlowControl_None;
-    USART1->BRR = FUNCONF_SYSTEM_CORE_CLOCK  / 115200UL;
+    USART1->BRR = FUNCONF_SYSTEM_CORE_CLOCK  / 9600UL;
     USART1->CTLR1 |= CTLR1_UE_Set;
 
     char nmeamsg[128];
@@ -224,11 +138,19 @@ int main() {
     uint8_t nmeamsg_checksum = 0;
     bool nmeamsg_data_end = false;
 
-    // Config GNSS receiver for 115200 bps
-    // Send the command at 9600 bps, which is default
+    struct __attribute__((packed)) {
+        uint32_t timestamp;
+        uint8_t valid;
+    } push_data_buf;
+
+    // UART_put("$PCAS01,5*19\r\n", 14); // set 115200
+
+    // Config GNSS receiver to transmit less data
     Delay_Ms(1000); // wait for receiver bootup
-    UART_put("$PCAS01,5*19\r\n", 14);
-    Delay_Ms(1000); // wait for baud rate change
+    // UART_puts("$PCAS03,1,1,1,1,1,1,1,1,,,,,,*02\r\n"); // enable all messages
+    // UART_puts("$PCAS03,0,0,0,0,1,0,0,0,,,,,,*03\r\n"); // enable only RMC
+    UART_puts("$PCAS03,1,0,0,0,1,0,0,0,,,,,,*02\r\n"); // enable only RMC and GGA
+    Delay_Ms(1000); // wait for disable to take action
 
     while(1) {
         if (USART1->STATR & USART_STATR_RXNE) {
@@ -284,15 +206,117 @@ int main() {
                                         }
                                     }
                                     field_idx++;
-
                                     field_start = i+1;
                                 }
                             }
-                            NVIC_DisableIRQ(I2C1_EV_IRQn);
-                            time = unix_from_utc(Y,M,D,h,m,s);
-                            last_valid_timestamp = fix;
-                            NVIC_EnableIRQ(I2C1_EV_IRQn);
-                            I2C1->CTLR1 = I2C1_CTLR1_DEFAULT | I2C_CTLR1_START;
+
+                            update_timestamp(fix, Y, M, D, h, m, s);
+                            if (i2c_master_done()) {
+                                push_data_buf.timestamp = timestamp_value;
+                                push_data_buf.valid = timestamp_valid?1:0;
+                                i2c_master_transfer(0x10, &push_data_buf, sizeof(push_data_buf));
+                            }
+                        } else if(strncmp(nmeamsg, "GNGGA", 5) == 0) {
+                            int field_idx = 0;
+                            int field_start = 0;
+
+                            int64_t lat, lon;
+                            uint8_t nsat;
+
+                            for(int i=0;i<nmeamsg_len;i++) {
+                                if (nmeamsg[i] == ',') {
+                                    char* field_ptr = nmeamsg + field_start;
+                                    int field_len = i - field_start;
+
+                                    // an nmeamsg field ends. null terminate the field.
+                                    nmeamsg[i] = 0;
+
+                                    // latitude handling
+                                    if (field_idx==2) {
+                                        if (field_len >= 4) {
+                                            int lat_deg = decpair_to_value(field_ptr+0);
+                                            int lat_min = decpair_to_value(field_ptr+2);
+
+                                            int lat_min_frac = 0;
+                                            int64_t scale = 1LL;
+                                            for (int j=5;j<field_len;j++) {
+                                                lat_min_frac = lat_min_frac*10 + digitvalue(*(field_ptr+j));
+                                                scale *= 10LL;
+                                            }
+
+                                            // maximal resolution as fractional minutes
+                                            lat = (lat_deg*60LL + lat_min)*scale + lat_min_frac;
+
+                                            // scale to 360/2^32 degrees per LSB.
+                                            lat *= 0x8000000LL; // = 2^32 / 2^5
+                                            lat /= 675LL;       // = 21600 / 2^5
+                                            lat /= scale;
+                                        }
+                                    }
+                                    if (field_idx==3) {
+                                        if (field_len == 1) {
+                                            if (*field_ptr == 'S') {
+                                                lat *= -1;
+                                            } else if(*field_ptr != 'N') {
+                                                lat = 0;
+                                            }
+                                        }
+                                    }
+
+                                    // longitude handling
+                                    if (field_idx==4) {
+                                        if (field_len >= 5) {
+                                            int lon_deg = dectriple_to_value(field_ptr+0);
+                                            int lon_min = decpair_to_value(field_ptr+3);
+
+                                            int lon_min_frac = 0;
+                                            int64_t scale = 1LL;
+                                            for (int j=6;j<field_len;j++) {
+                                                lon_min_frac = lon_min_frac*10 + digitvalue(*(field_ptr+j));
+                                                scale *= 10LL;
+                                            }
+
+                                            // maximal resolution as fractional minutes
+                                            lon = (lon_deg*60LL + lon_min)*scale + lon_min_frac;
+
+                                            // scale to 360/2^32 degrees per LSB.
+                                            lon *= 0x8000000LL; // = 2^32 / 2^5
+                                            lon /= 675LL;       // = 21600 / 2^5
+                                            lon /= scale;
+                                        }
+                                    }
+                                    if (field_idx==5) {
+                                        if (field_len == 1) {
+                                            if (*field_ptr == 'W') {
+                                                lon *= -1;
+                                            } else if(*field_ptr != 'E') {
+                                                lon = 0;
+                                            }
+                                        }
+                                    }
+
+                                    if (field_idx==7) {
+                                        if (field_len == 1) {
+                                            nsat = digitvalue(*field_ptr);
+                                        } else if (field_len == 2) {
+                                            nsat = decpair_to_value(field_ptr);
+                                        } else if (field_len == 3) {
+                                            nsat = dectriple_to_value(field_ptr);
+                                        } else {
+                                            nsat = -1;
+                                        }
+                                    }
+
+                                    field_idx++;
+                                    field_start = i+1;
+                                }
+                            }
+
+                            update_auxiliary(lat, lon, nsat);
+                        } else {
+                            // received valid NMEA for unexpected message
+                            // re-disable other messages
+                            UART_puts("$PCAS03,1,0,0,0,1,0,0,0,,,,,,*02\r\n"); // enable only RMC and GGA
                         }
                     }
                 }
