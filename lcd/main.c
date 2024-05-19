@@ -52,29 +52,70 @@ void send_hd44780_data(uint8_t data) {
 }
 
 void init_hd44780() {
-    // send set 4 bit interface comand three times
-    // to ensure command is correctly interpreted
+    Delay_Ms(100);
+
+    // initially set the controller into 8 bit mode
+    // this can be guaranteed from any state by
+    // writing the function set command 3 times
     for (int i=0;i<3;i++) {
-        output_byte_595( 0x20 | (1<<2) );
-        output_byte_595( 0x20 );
-        Delay_Us(37); // 37 us max cmd execution time
+        output_byte_595( 0x30 | (1<<2) );
+        output_byte_595( 0x30 );
+        Delay_Us(4100);
     }
+
+    // display is now guaranteed to be in 8 bit mode
+
+    // set display to 4 bit mode
+    output_byte_595( 0x20 | (1<<2) );
+    output_byte_595( 0x20 );
+    Delay_Us(100);
+
+    // display is now guaranteed to be in 4 bit mode.
+    // carry on with proper configuration.
 
     // set 4 bit interface, 1/16 duty, 5x8 dots
     send_hd44780_command(0b00101000);
-    Delay_Us(37); // 37 us max cmd execution time
+    Delay_Us(100);
+
+    // enable display
+    send_hd44780_command(0b00001100);
+    Delay_Us(100);
 
     // clear display
     send_hd44780_command(0x01);
-    Delay_Us(1520); // 1520 us max cmd execution time
+    Delay_Us(3000);
 
     // cursor home
     send_hd44780_command(0x02);
-    Delay_Us(1520); // 1520 us max cmd execution time
+    Delay_Us(3000);
+}
 
-    // enable display
-    send_hd44780_command(0b00001111);
-    Delay_Us(37); // 37 us max cmd execution time
+void set_pos_hd44780(uint8_t pos) {
+    send_hd44780_command(0x80 | (pos & 0x7f));
+    Delay_Us(100);
+}
+
+void puts_hd44780(char* string) {
+    while(*string) {
+        send_hd44780_data(*string);
+        Delay_Us(100);
+        string++;
+    }
+}
+
+int mini_vsnprintf(char *buffer, unsigned int buffer_len, const char *fmt, va_list va);
+
+int printf_hd44780(char* format, ...) {
+    va_list args;
+    va_start(args, format);
+
+    char string[128];
+    int ret = mini_vsnprintf(string, sizeof(string), format, args);
+    va_end(args);
+
+    puts_hd44780(string);
+
+    return ret;
 }
 
 int main() {
@@ -94,8 +135,15 @@ int main() {
 
     init_hd44780();
 
+    int val = 0;
     while(1) {
-        send_hd44780_data('!');
+        set_pos_hd44780(0x00);
+        printf_hd44780("First row: %d", val);
+
+        set_pos_hd44780(0x40);
+        printf_hd44780("Second row: %d", val);
+
         Delay_Ms(1000);
+        val++;
     }
 }
