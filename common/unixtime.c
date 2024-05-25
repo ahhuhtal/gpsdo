@@ -11,40 +11,40 @@ static bool is_leap_year(uint16_t year) {
     return (year % 4) == 0 && ((year % 100) != 0 || (year % 400) == 0);
 }
 
-uint32_t unix_from_utc(int Y, int M, int D, int h, int m, int s) {
+uint32_t unix_from_utc(struct utc_time utc) {
 
-    D -= 1; // shift to [0, 30]
-    M -= 1; // shift to [0, 11]
+    utc.D -= 1; // shift to [0, 30]
+    utc.M -= 1; // shift to [0, 11]
 
     // Check that the UTC time is valid.
-    if (s >= 60 || m >= 60 || h >= 24 || M >= 12) {
+    if (utc.s >= 60 || utc.m >= 60 || utc.h >= 24 || utc.M >= 12) {
         return 0;
     }
 
-    bool leap_year = is_leap_year(Y);
+    bool leap_year = is_leap_year(utc.Y);
 
     // Check that the days are valid.
-    if (M == 1 && leap_year) {
-        if (D >= 29) {
+    if (utc.M == 1 && leap_year) {
+        if (utc.D >= 29) {
             return 0;
         }
     } else {
-        if (D >= DAYS_IN_MONTH[M]) {
+        if (utc.D >= DAYS_IN_MONTH[utc.M]) {
             return 0;
         }
     }
 
     // Compute number of full days since epoch (begin of 1970).
-    uint32_t days_since_epoch = D;
-    days_since_epoch += DAYS_BEFORE_MONTH[M];
-    if (leap_year && M > 1) {
+    uint32_t days_since_epoch = utc.D;
+    days_since_epoch += DAYS_BEFORE_MONTH[utc.M];
+    if (leap_year && utc.M > 1) {
         days_since_epoch += 1;
     }
-    for (int32_t y = 1970; y < Y; y++) {
+    for (int32_t y = 1970; y < utc.Y; y++) {
         days_since_epoch += (is_leap_year(y) ? 366 : 365);
     }
 
-    int64_t time = s + (SEC_IN_MINUTE * m) + (SEC_IN_HOUR * h);
+    int64_t time = utc.s + (SEC_IN_MINUTE * utc.m) + (SEC_IN_HOUR * utc.h);
     time += SEC_IN_DAY * (int64_t) days_since_epoch;
 
     if (time > UINT32_MAX) {
@@ -54,13 +54,7 @@ uint32_t unix_from_utc(int Y, int M, int D, int h, int m, int s) {
     return time;
 }
 
-/*
- * Move epoch from 01.01.1970 to 01.03.0000 (yes, Year 0) - this is the first
- * day of a 400-year long "era", right after additional day of leap year.
- * This adjustment is required only for date calculation, so instead of
- * modifying time_t value (which would require 64-bit operations to work
- * correctly) it's enough to adjust the calculated number of days since epoch.
- */
+/* Move epoch from 01.01.1970 to 01.03.0000 to simplify calculations */
 #define EPOCH_ADJUSTMENT_DAYS INT32_C(719468)
 /* year to which the adjustment was made */
 #define ADJUSTED_EPOCH_YEAR 0
@@ -91,7 +85,7 @@ void utc_from_unix(uint32_t timestamp, struct utc_time *utc)
     uint32_t era_year =
         (era_day - (era_day / (DAYS_PER_4_YEARS - 1)) + (era_day / DAYS_PER_CENTURY) - (era_day / (DAYS_PER_ERA - 1))) / 365; // [0, 399]
     uint32_t year_day = era_day - (DAYS_PER_YEAR * era_year + era_year / 4 - era_year / 100); // [0, 365]
-    uint32_t month = month = (5 * year_day + 2) / 153; // [0, 11]
+    uint32_t month = (5 * year_day + 2) / 153; // [0, 11], where 0 is March and 11 is February
     uint32_t day = year_day - (153 * month + 2) / 5; // [0, 30]
     month += (month < 10) ? 2 : -10;
     int32_t year = ADJUSTED_EPOCH_YEAR + era_year + era * YEARS_PER_ERA + (month <= 1);
