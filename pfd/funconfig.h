@@ -5,7 +5,7 @@
 #define CH32V003
 #endif
 
-#define FUNCONF_USE_DEBUGPRINTF 1
+#define FUNCONF_USE_DEBUGPRINTF 0
 
 #define FUNCONF_DEBUGPRINTF_TIMEOUT (1<<31) // Wait for a very very long time.
 
