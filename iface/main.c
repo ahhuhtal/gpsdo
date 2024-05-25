@@ -46,7 +46,7 @@ void update_auxiliary(int32_t lat, int32_t lon, uint8_t nsat) {
 }
 
 // packed struct when pulling data
-struct __attribute__((packed)) {
+volatile struct __attribute__((packed)) {
     uint32_t timestamp; // unix time of fix.
     int32_t lat; // fraction of 360 degrees in Q0.31 format. North is positive.
     int32_t lon; // fraction of 360 degrees in Q0.31 format. East is positive.
@@ -138,7 +138,7 @@ int main() {
     uint8_t nmeamsg_checksum = 0;
     bool nmeamsg_data_end = false;
 
-    struct __attribute__((packed)) {
+    volatile struct __attribute__((packed)) {
         uint32_t timestamp;
         uint8_t valid;
     } push_data_buf;
