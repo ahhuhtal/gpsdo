@@ -150,6 +150,8 @@ int main() {
     // UART_puts("$PCAS03,1,1,1,1,1,1,1,1,,,,,,*02\r\n"); // enable all messages
     // UART_puts("$PCAS03,0,0,0,0,1,0,0,0,,,,,,*03\r\n"); // enable only RMC
     UART_puts("$PCAS03,1,0,0,0,1,0,0,0,,,,,,*02\r\n"); // enable only RMC and GGA
+    // UART_puts("$PCAS04,1*18\r\n"); // use only GPS
+    UART_puts("$PCAS04,3*1A\r\n"); // GPS + BeiDou
     Delay_Ms(1000); // wait for disable to take action
 
     while(1) {
@@ -169,7 +171,8 @@ int main() {
                     uint8_t nmeamsg_checksum_data = hexpair_to_value(nmeamsg + nmeamsg_len - 2);
 
                     if (nmeamsg_checksum_data == nmeamsg_checksum) {
-                        if (strncmp(nmeamsg, "GNRMC", 5) == 0) {
+                        if ( (strncmp(nmeamsg, "GPRMC", 5) == 0) ||
+                             (strncmp(nmeamsg, "GNRMC", 5) == 0)) {
                             int field_idx = 0;
                             int field_start = 0;
 
@@ -216,7 +219,8 @@ int main() {
                                 push_data_buf.valid = timestamp_valid?1:0;
                                 i2c_master_transfer(0x10, &push_data_buf, sizeof(push_data_buf));
                             }
-                        } else if(strncmp(nmeamsg, "GNGGA", 5) == 0) {
+                        } else if( (strncmp(nmeamsg, "GPGGA", 5) == 0) ||
+                                   (strncmp(nmeamsg, "GNGGA", 5) == 0)) {
                             int field_idx = 0;
                             int field_start = 0;
 
