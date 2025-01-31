@@ -26,7 +26,7 @@ static volatile uint8_t master_address;
 static volatile uint8_t* master_buf;
 static volatile size_t master_buf_len;
 static volatile bool master_busy;
-static volatile bool master_error;
+static volatile int master_error;
 
 static volatile size_t transfer_index;
 
@@ -135,7 +135,7 @@ void I2C1_ER_IRQHandler(void) {
             // error. slave did not acknowledge.
             I2C1->STAR1 = s1 & (~I2C_STAR1_AF);
             I2C1->CTLR1 = I2C_CTLR1_DEFAULT | I2C_CTLR1_STOP;
-            master_error = true;
+            master_error = 1;
             master_busy = false;
         } else {
             // normal. master does not acknowledge last received byte.
@@ -152,7 +152,7 @@ void I2C1_ER_IRQHandler(void) {
     if (s1 & I2C_STAR1_BERR) {
         I2C1->STAR1 = s1 & (~I2C_STAR1_BERR);
         master_busy = false;
-        master_error = true;
+        master_error = 2;
         slave_tx_busy = false;
         slave_rx_busy = false;
     }
@@ -181,59 +181,59 @@ void i2c_init(uint8_t address, uint32_t bitrate) {
     I2C1->CTLR2 = I2C_CTLR2_DEFAULT;
 }
 
-static void acquire(void) {
+void i2c_acquire(void) {
     NVIC_DisableIRQ(I2C1_EV_IRQn);
     NVIC_DisableIRQ(I2C1_ER_IRQn);
 }
 
-static void release(void) {
+void i2c_release(void) {
     NVIC_EnableIRQ(I2C1_EV_IRQn);
     NVIC_EnableIRQ(I2C1_ER_IRQn);
 }
 
 void i2c_set_slave_tx(volatile void* buf, size_t len, void(*callback)(void)) {
-    acquire();
+    i2c_acquire();
     while (slave_tx_busy) {
-        release();
-        acquire();
+        i2c_release();
+        i2c_acquire();
     }
     slave_tx_buf = buf;
     slave_tx_buf_len = len;
     slave_tx_start_cb = callback;
-    release();
+    i2c_release();
 }
 
 void i2c_set_slave_rx(volatile void* buf, size_t len, void(*callback)(void)) {
-    acquire();
+    i2c_acquire();
     while (slave_tx_busy) {
-        release();
-        acquire();
+        i2c_release();
+        i2c_acquire();
     }
     slave_rx_buf = buf;
     slave_rx_buf_len = len;
     slave_rx_done_cb = callback;
-    release();
+    i2c_release();
 }
 
 void i2c_master_transfer(uint8_t address, volatile void* buf, size_t len) {
-    acquire();
+    i2c_acquire();
     while (master_busy) {
-        release();
-        acquire();
+        i2c_release();
+        i2c_acquire();
     }
     master_address = address;
     master_buf = buf;
     master_buf_len = len;
-    master_error = false;
+    master_error = 0;
     master_busy = true;
     I2C1->CTLR1 = I2C_CTLR1_DEFAULT | I2C_CTLR1_START;
-    release();
+    i2c_release();
 }
 
 bool i2c_master_done(void) {
     return !master_busy;
 }
 
-bool i2c_master_error(void) {
+int i2c_master_error(void) {
     return master_error;
 }
