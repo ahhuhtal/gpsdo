@@ -7,74 +7,149 @@
 
 #include "ch32v003fun.h"
 
+int mini_vsnprintf(char *buffer, unsigned int buffer_len, const char *fmt, va_list va);
+
+/*
+ * GPSDO LCD board sub-unit software implementation
+ *
+ * 1. Pulls data from the GNSS interface, PLL controller and OCXO board
+ * 2. Controls an HD44780 LCD through a 74HC595 shift register
+ *    to display the data for the user.
+ *
+ * The HC595 is connected to the MCU as follows:
+ *  PA2 --> SRCLK (shift clock)
+ *  PA1 --> SDIN (shift data in)
+ *  PC4 --> RCLK (latch clock)
+ *
+ * The HD44780 is connected to the HC595 as follows:
+ *  QB (bit 1) --> RS
+ *  QC (bit 2) --> E
+ *  QE (bit 4) --> D4
+ *  QF (bit 5) --> D5
+ *  QG (bit 6) --> D6
+ *  QH (bit 7) --> D7
+ * Note: QA, QD and QH' are not used.
+ */
+
+/**
+ * Set HC595 shift clock state
+ * @param val true for high, false for low
+ */
 static inline void set_595_clock(bool val) {
-    GPIOA->BSHR = (1<<18) | (val?(1<<2):0);
+    // bit 18 is PA2 clear, bit 2 is PA2 set
+    GPIOA->BSHR = (1 << 18) | (val ? (1 << 2) : 0);
 }
 
+/**
+ * Set HC595 shift in data
+ * @param val true for high, false for low
+ */
 static inline void set_595_data(bool val) {
-    GPIOA->BSHR = (1<<17) | (val?(1<<1):0);
+    // bit 17 is PA1 clear, bit 1 is PA1 set
+    GPIOA->BSHR = (1 << 17) | (val ? (1 << 1) : 0);
 }
 
+/**
+ * Set HC595 latch clock state
+ * @param val true for high, false for low
+ */
 static inline void set_595_latch(bool val) {
-    GPIOC->BSHR = (1<<20) | (val?(1<<4):0);
+    // bit 20 is PC4 clear, bit 4 is PC4 set
+    GPIOC->BSHR = (1 << 20) | (val ? (1 << 4) : 0);
 }
 
+/**
+ * Shift a byte in the HC595 shift register and latch it out
+ * @param byte the byte to output
+ */
 void output_byte_595(uint8_t byte) {
     set_595_clock(false);
     set_595_data(false);
 
-    for(int i=0;i<8;i++) {
-        set_595_data( (byte & 0x80) != 0);
+    // clock the bits in
+    for (int i = 0; i < 8; i++) {
+        set_595_data( (byte & 0x80) != 0 );
         set_595_clock(true);
         set_595_clock(false);
         byte <<= 1;
     }
 
+    // latch the byte out
     set_595_latch(true);
     set_595_latch(false);
 }
 
+/**
+ * Send data/command to the HD44780 display.
+ * Note: Only the high nibble of the value is used, the low 4 bits are always sent as 0.
+ * @param rs true if data, false if command
+ * @param value the value to output
+ */
+void send_hd44780_register(bool rs, uint8_t value) {
+    // pick high nibble of value
+    // set or clear bit 1 to select the register
+    uint8_t byte = (value & 0xf0) | (rs ? (1 << 1) : 0);
+    // output byte with E = 1
+    output_byte_595(byte | (1 << 2));
+    // output byte with E = 0
+    output_byte_595(byte);
+}
+
+/**
+ * Send a command to the HD44780 display in 4 bit mode
+ * @param cmd the command to send
+ */
 void send_hd44780_command(uint8_t cmd) {
-    output_byte_595( (cmd & 0xf0) | (1<<2) );
-    output_byte_595( (cmd & 0xf0) );
-
-    cmd <<= 4;
-
-    output_byte_595( (cmd & 0xf0) | (1<<2) );
-    output_byte_595( (cmd & 0xf0) );
+    // output bits 7..4 as command
+    send_hd44780_register(false, cmd);
+    // output bits 3..0 as command
+    send_hd44780_register(false, cmd << 4);
 }
 
+/**
+ * Send a data byte to the HD44780 display in 4 bit mode
+ * @param data the data byte to send
+ */
 void send_hd44780_data(uint8_t data) {
-    output_byte_595( (data & 0xf0) | (1<<2) | (1<<1) );
-    output_byte_595( (data & 0xf0) | (1<<1) );
-
-    data <<= 4;
-
-    output_byte_595( (data & 0xf0) | (1<<2) | (1<<1) );
-    output_byte_595( (data & 0xf0) | (1<<1) );
+    // output bits 7..4 as data
+    send_hd44780_register(true, data);
+    // output bits 3..0 as command
+    send_hd44780_register(true, data << 4);
 }
 
+/**
+ * Initialize the HD44780 display.
+ *
+ * During initialization, the display controller
+ * is first put into 8 bit mode and then to 4 bit mode
+ */
 void init_hd44780() {
+    // allow display some time to power on
     Delay_Ms(100);
 
-    // initially set the controller into 8 bit mode
-    // this can be guaranteed from any state by
-    // writing the function set command 3 times
+    /*
+     * Set the controller into 8 bit mode.
+     * This can be guaranteed from any state by
+     * writing the function set command 3 times
+     */
     for (int i=0;i<3;i++) {
-        output_byte_595( 0x30 | (1<<2) );
-        output_byte_595( 0x30 );
+        // set 8 bit mode
+        send_hd44780_register(false, 0x30);
+        // wait maximum command execution time
         Delay_Us(4100);
     }
 
-    // display is now guaranteed to be in 8 bit mode
+    // the display is now guaranteed to be in 8 bit mode
 
-    // set display to 4 bit mode
-    output_byte_595( 0x20 | (1<<2) );
-    output_byte_595( 0x20 );
+    // set 4 bit mode
+    send_hd44780_register(false, 0x20);
+    // wait for maximum command execution time
     Delay_Us(100);
 
-    // display is now guaranteed to be in 4 bit mode.
-    // carry on with proper configuration.
+    /*
+     * Display is now guaranteed to be in 4 bit mode.
+     * Carry on with proper configuration.
+     */
 
     // set 4 bit interface, 1/16 duty, 5x8 dots
     send_hd44780_command(0b00101000);
@@ -93,17 +168,31 @@ void init_hd44780() {
     Delay_Us(3000);
 }
 
+/**
+ * Move cursor to given position
+ * @param pos position to move the cursor to
+ */
 void set_pos_hd44780(uint8_t pos) {
     send_hd44780_command(0x80 | (pos & 0x7f));
     Delay_Us(100);
 }
 
+/**
+ * Output a character to the HD44780 display
+ * @param ch character to send
+ * @return the character which was output
+ */
 int putchar_hd44780(int ch) {
     send_hd44780_data(ch);
     Delay_Us(100);
     return ch;
 }
 
+/**
+ * Output a string to the HD44780 display
+ * @param string string to output
+ * @return the value 0
+ */
 int puts_hd44780(char* string) {
     while(*string) {
         putchar_hd44780(*(string++));
@@ -111,8 +200,12 @@ int puts_hd44780(char* string) {
     return 0;
 }
 
-int mini_vsnprintf(char *buffer, unsigned int buffer_len, const char *fmt, va_list va);
-
+/**
+ * printf implementation for HD44780 display
+ * @param format format string
+ * @param ... further arguments
+ * @return number of chars printed
+ */
 int printf_hd44780(char* format, ...) {
     va_list args;
     va_start(args, format);
@@ -126,6 +219,16 @@ int printf_hd44780(char* format, ...) {
     return ret;
 }
 
+/**
+ * printf to a given field as right justified
+ * If string does not fit field, prints starting at field start position
+ * and exceeds field width toward the right.
+ * @param pos field start position
+ * @param cols width of field
+ * @param format format string
+ * @param ... further arguments
+ * @return number of relevant chars printed
+ */
 int printf_hd44780_right_justified(uint8_t pos, uint8_t cols, char* format, ...) {
     va_list args;
     va_start(args, format);
@@ -147,6 +250,16 @@ int printf_hd44780_right_justified(uint8_t pos, uint8_t cols, char* format, ...)
     return ret;
 }
 
+/**
+ * printf to a given field as left justified
+ * If string does not fit field, prints starting at field start position
+ * and exceeds field width toward the right.
+ * @param pos field start position
+ * @param cols width of field
+ * @param format format string
+ * @param ... further arguments
+ * @return number of relevant chars printed
+ */
 int printf_hd44780_left_justified(uint8_t pos, uint8_t cols, char* format, ...) {
     va_list args;
     va_start(args, format);
@@ -186,40 +299,45 @@ int main() {
     init_hd44780();
     i2c_init(0x12, 100000UL);
 
+    // data structure fetched from GNSS interface
     volatile struct __attribute__((packed)) {
         uint32_t timestamp; // unix time of fix.
         int32_t lat; // fraction of 360 degrees in Q0.31 format. North is positive.
         int32_t lon; // fraction of 360 degrees in Q0.31 format. East is positive.
-        uint8_t nsat_fix_valid; // bit 7: validity, bits [6:0] number of satellites
+        uint8_t nsat_fix_valid; // bit 7: is valid, bit 6: has fix, bits [5:0] number of satellites
     } iface_data;
     int iface_error;
 
-    // data structure for pulling data from us
+    // data structure fetched from PLL controller
     volatile struct __attribute__((packed)) {
         int32_t phase_error_raw; // deviation from UTC second, LSB = 50 ns
         int32_t phase_error_filtered; // Q7.24, LSB ~= 3.0 fs
         int32_t frequecy_error_raw; // OCXO frequency error, LSB = 0.5 Hz
-        int32_t frequency_error_filtered; // Q7.24, LSB ~= 60 nHz
-        uint32_t time_since_valid; // How long since last control update (i.e. since valid GPS data)
+        int32_t frequency_error_filtered; // Q7.24, LSB ~= 29.8 nHz
+        uint32_t time_since_valid; // How many seconds since last control update (i.e. since valid GPS data)
         int16_t ocxo_control_word; // OCXO control word
         uint8_t control_mode; // Which control mode are we in 0=FLL, 1=fast PLL, 2=slow PLL
     } pfd_data;
     int pfd_error;
 
+    // temperature fetched from the OCXO board
     volatile uint16_t temperature;
     int temperature_error;
 
     uint32_t error_count = 0;
 
     while(1) {
+        // fetch data from GNSS interface
         i2c_master_transfer(0x03, &iface_data, sizeof(iface_data));
         while(!i2c_master_done());
         iface_error = i2c_master_error();
 
+        // fetch temperature from OCXO board
         i2c_master_transfer(0x0d, &temperature, sizeof(temperature));
         while(!i2c_master_done());
         temperature_error = i2c_master_error();
 
+        // fetch data from PLL controller
         i2c_master_transfer(0x11, &pfd_data, sizeof(pfd_data));
         while(!i2c_master_done());
         pfd_error = i2c_master_error();
@@ -251,13 +369,15 @@ int main() {
         } else {
             error_count = 0;
 
+            // compute ferr as number of millihertz
             int ferr = (pfd_data.frequency_error_filtered * 500LL) / 16777216LL;
+            // compute perr as number of nanoseconds
             int perr = (pfd_data.phase_error_filtered * 50LL) / 16777216LL;
             bool valid = (iface_data.nsat_fix_valid & 0x80) != 0;
             bool fix = (iface_data.nsat_fix_valid & 0x40) != 0;
 
             int nsat = iface_data.nsat_fix_valid & 0x3f;
- 
+
             int time_since_valid = pfd_data.time_since_valid;
 
             struct utc_time utc;
