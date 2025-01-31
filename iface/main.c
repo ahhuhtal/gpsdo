@@ -11,9 +11,12 @@
 
 // push and pull data
 
+// is data valid
+volatile bool valid;
+
 // timestamp data
-volatile bool timestamp_valid;
-volatile uint32_t timestamp_value;
+volatile bool fix;
+volatile uint32_t timestamp;
 volatile uint32_t timestamp_tick;
 
 // auxiliary data
@@ -21,19 +24,20 @@ volatile int32_t latitude;
 volatile int32_t longitude;
 volatile uint8_t n_satellites;
 
-void update_timestamp(bool valid, int Y, int M, int D, int h, int m, int s) {
-    uint32_t value = unix_from_utc(Y,M,D,h,m,s);
+void update_timestamp(bool has_fix, int Y, int M, int D, int h, int m, int s) {
+    uint32_t value = unix_from_utc((struct utc_time){Y,M,D,h,m,s});
     __disable_irq();
     timestamp_tick = SysTick->CNT;
-    timestamp_valid = valid;
-    timestamp_value = value;
+    fix = has_fix;
+    valid = true;
+    timestamp = value;
     __enable_irq();
 }
 
-void poll_timestamp() {
-    const uint32_t timeout = FUNCONF_SYSTEM_CORE_CLOCK/8;
+void poll_data() {
+    const uint32_t timeout = 4*(FUNCONF_SYSTEM_CORE_CLOCK/8);
     if (SysTick->CNT - timestamp_tick > timeout) {
-        timestamp_valid = false;
+        valid = false;
     }
 }
 
@@ -42,6 +46,7 @@ void update_auxiliary(int32_t lat, int32_t lon, uint8_t nsat) {
     latitude = lat;
     longitude = lon;
     n_satellites = nsat;
+    valid = true;
     __enable_irq();
 }
 
@@ -50,15 +55,15 @@ volatile struct __attribute__((packed)) {
     uint32_t timestamp; // unix time of fix.
     int32_t lat; // fraction of 360 degrees in Q0.31 format. North is positive.
     int32_t lon; // fraction of 360 degrees in Q0.31 format. East is positive.
-    uint8_t nsat_valid; // bit 7: validity, bits [6:0] number of satellites
+    uint8_t nsat_fix_valid; // bit 7: validity, bit 6: fix, bits [5:0] number of satellites
 } pull_data_buf;
 
 // called when request to pull data is received
 void update_tx_callback() {
-    pull_data_buf.timestamp = timestamp_value;
+    pull_data_buf.timestamp = timestamp;
     pull_data_buf.lat = latitude;
     pull_data_buf.lon = longitude;
-    pull_data_buf.nsat_valid = n_satellites | (timestamp_valid?0x80:0x00);
+    pull_data_buf.nsat_fix_valid = (n_satellites&0x3f) | (fix?0x40:0x00) | (valid?0x80:0x00);
 }
 
 void UART_bitbang(uint8_t ch) {
@@ -140,7 +145,7 @@ int main() {
 
     volatile struct __attribute__((packed)) {
         uint32_t timestamp;
-        uint8_t valid;
+        uint8_t fix;
     } push_data_buf;
 
     // UART_put("$PCAS01,5*19\r\n", 14); // set 115200
@@ -155,6 +160,8 @@ int main() {
     Delay_Ms(1000); // wait for disable to take action
 
     while(1) {
+        poll_data();
+    
         if (USART1->STATR & USART_STATR_RXNE) {
             char ch = USART1->DATAR;
 
@@ -215,8 +222,8 @@ int main() {
 
                             update_timestamp(fix, Y, M, D, h, m, s);
                             if (i2c_master_done()) {
-                                push_data_buf.timestamp = timestamp_value;
-                                push_data_buf.valid = timestamp_valid?1:0;
+                                push_data_buf.timestamp = timestamp;
+                                push_data_buf.fix = fix?1:0;
                                 i2c_master_transfer(0x10, &push_data_buf, sizeof(push_data_buf));
                             }
                         } else if( (strncmp(nmeamsg, "GPGGA", 5) == 0) ||
