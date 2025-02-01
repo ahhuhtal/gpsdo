@@ -31,9 +31,52 @@ volatile struct {
     uint8_t valid;
 } __attribute__((packed)) rx_data_buf;
 
+/**
+ * Get the current tick counter value.
+ * Try to account for the fact that the full (sw + hw) tick count
+ * cannot be read atomically.
+ *
+ * I'm not absolutely sure that this routine is water tight.
+ * If the TIM1 overflow happens at just the right time,
+ * it might be possible to produce an incorrect tick count
+ */
+uint64_t get_current_tick(void) {
+    __disable_irq();
+    uint16_t hw_tick = TIM1->CNT;
+    uint64_t sw_tick = tick_high;
+    uint16_t tim1_intfr = TIM1->INTFR;
+    uint16_t hw_tick_late = TIM1->CNT;
+    __enable_irq();
+
+    // check if the TIM1 overflow was set
+    if (tim1_intfr & TIM_UIF) {
+        /*
+         * The overflow could have occurred at three critical times:
+         *  1. After interrupts disabled, but before hw_tick read
+         *  2. After hw_tick read, but before/during sw_tick read
+         *  3. After sw_tick read
+         *
+         * For cases 2 and 3, we have hw_tick_late < hw_tick.
+         * In those cases hw_tick is consistent with sw_tick,
+         * as hw_tick represents the pre-overflow value and
+         * the ISR for updating the sw_tick hasn't executed yet.
+         *
+         * In case 1, however, hw_tick represents the post-overflow
+         * value, but sw_tick represents a pre-overflow value.
+         */
+
+        if (hw_tick < hw_tick_late) {
+            sw_tick += 65536;
+        }
+    }
+
+    return sw_tick + hw_tick;
+}
+
 // called when someone has pushed data to us
 void rx_done_callback(void) {
-    last_timestamp_tick = tick_high + TIM1->CNT;
+    last_timestamp_tick = get_current_tick();
+
     // double buffer the data so that it changes atomically
     last_timestamp = rx_data_buf.timestamp;
     last_timestamp_valid = rx_data_buf.valid;
@@ -65,7 +108,7 @@ void tx_start_callback(void) {
     tx_data_buf.phase_error_filtered = last_phase_error_filtered;
     tx_data_buf.frequecy_error_raw = last_frequency_error_raw;
     tx_data_buf.frequency_error_filtered = last_frequency_error_filtered;
-    tx_data_buf.time_since_valid = (tick_high + TIM1->CNT - last_tick_valid) / 20000000UL;
+    tx_data_buf.time_since_valid = (get_current_tick() - last_tick_valid) / 20000000UL;
     tx_data_buf.ocxo_control_word = last_ocxo_control_word;
     tx_data_buf.control_mode = last_control_mode;
 }
@@ -89,10 +132,63 @@ void TIM1_UP_IRQHandler(void) {
     TIM1->INTFR = ~TIM_UIF;
 }
 
+/**
+ * Timer 1 capture-compare interrupt
+ *
+ * Handles PPS input capture timing.
+ * Attempts to handle the issues caused by non-atomicity of the full
+ * (sw + hw) tick counting.
+ *
+ * Additionally handles a part of the PPS output generation.
+ */
 void TIM1_CC_IRQHandler(void) __attribute__((interrupt));
 void TIM1_CC_IRQHandler(void) {
     if (TIM1->INTFR & TIM_CC4IF) {
-        uint64_t new_tick = tick_high + TIM1->CH4CVR;
+        uint16_t hw_tick = TIM1->CNT;
+        uint16_t tim1_intfr = TIM1->INTFR;
+        uint64_t sw_tick = tick_high;
+        uint16_t capture_value = TIM1->CH4CVR;
+
+        /*
+         * Critical moments for TIM1 overflow to occur:
+         *  1. Before CC4 capture.
+         *  2. After CC4 capture, but before entering this ISR
+         *  3. After entering this ISR, but before reading hw_tick
+         *  4. After reading hw_tick, but before reading tim1_intfr
+         *
+         * In case 1, the ISR for updating sw_tick would have
+         * executed before entering this ISR. Thus the captured value
+         * and sw_tick are consistent and nothing extra needs to be done.
+         *
+         * In case 2, the ISR for updating sw_tick would have
+         * executed before entering this ISR. However, the captured value
+         * is from before the overflow. Thus the value must be adjusted.
+         *
+         * In cases 3-4, the ISR for updating sw_tick would not have
+         * executed before entering this ISR. Thus the captured value
+         * and sw_tick are consistent and nothing extra needs to be done.
+         *
+         * Case 2 and 3 are characterized by hw_tick being less than the
+         * the captured value. However, in case 2 the ISR has been serviced
+         * and thus the update interrupt flag is cleared, while in case 3
+         * it is set.
+         *
+         * In case 4, hw_tick is greater than the captured value, but the
+         * update interrupt flag is set.
+         */
+
+        uint64_t new_tick = sw_tick + capture_value;
+
+        if (hw_tick < capture_value) {
+            // case 2 or case 3 has occurred
+            if (!(tim1_intfr & TIM_UIF)) {
+                // case 2 occurred
+                // compensate for the extra count in sw_tick
+                new_tick -= 65536;
+            }
+        }
+
+        // compute the number of ticks since the last input PPS
         last_difftick_pps = new_tick - last_tick_pps;
         if (last_difftick_pps >= 19999900 && last_difftick_pps <= 20000100) {
             last_valid_pps = true;
@@ -149,8 +245,6 @@ int main() {
     TIM1->CTLR1 = TIM_CEN;
 
     NVIC_EnableIRQ(TIM1_UP_IRQn);
-    NVIC_SetPriority(TIM1_UP_IRQn, 0xc0); // updates at high priority
-
     NVIC_EnableIRQ(TIM1_CC_IRQn);
 
     int16_t ocxo_control_word;
