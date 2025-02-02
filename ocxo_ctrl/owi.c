@@ -1,24 +1,33 @@
+#include <stdbool.h>
+#include <stdint.h>
+#include <stddef.h>
+
 #include "owi.h"
 
 #include "ch32v003fun.h"
 
+/**
+ * Lazy implementation of Dallas 1-wire interface.
+ * Provides just enough functionality for this project.
+ */
+
 #define BSHR_SET_OFFSET 0
 #define BSHR_RESET_OFFSET 16
 
-#define OWI_setlow() { OWI_GPIO->BSHR = 1<<(BSHR_RESET_OFFSET+OWI_PIN); }
-#define OWI_sethigh() { OWI_GPIO->BSHR = 1<<(BSHR_SET_OFFSET+OWI_PIN); }
-#define OWI_sample() (((OWI_GPIO->INDR)&(1<<OWI_PIN)) != 0)
+#define OWI_setlow() { OWI_GPIO->BSHR = 1 << (BSHR_RESET_OFFSET + OWI_PIN); }
+#define OWI_sethigh() { OWI_GPIO->BSHR = 1 << (BSHR_SET_OFFSET + OWI_PIN); }
+#define OWI_sample() (((OWI_GPIO->INDR) & (1 << OWI_PIN)) != 0)
 
 uint8_t _crc_ibutton_update(uint8_t crc, uint8_t data) {
-	uint8_t i;
 	crc = crc ^ data;
-	for (i = 0; i < 8; i++) {
+	for (int i = 0; i < 8; i++) {
 		if (crc & 0x01) {
             crc = (crc >> 1) ^ 0x8C;
 		} else {
 			crc >>= 1;
 		}
     }
+
     return crc;
 }
 
@@ -26,23 +35,27 @@ void OWI_init(void) {
     OWI_sethigh();
 }
 
-uint8_t OWI_reset(void) {
-    uint8_t present;
+bool OWI_reset(void) {
+    bool present;
+
     OWI_setlow();
     Delay_Us(480); // AN126
     OWI_sethigh();
     Delay_Us(70); // AN126
-    if(OWI_sample()) {
-        present=0;
+
+    if (OWI_sample()) {
+        present = false;
     } else {
-        present=1;
+        present = true;
     }
+
     Delay_Us(410); // AN126
+
 	return present;
 }
 
-void OWI_writebit(uint8_t bit) {
-    if(bit) {
+void OWI_writebit(bool bit) {
+    if (bit) {
         OWI_setlow();
         Delay_Us(6); // AN126
         OWI_sethigh();
@@ -55,16 +68,18 @@ void OWI_writebit(uint8_t bit) {
     }
 }
 
-uint8_t OWI_readbit(void) {
-    uint8_t bit;
+bool OWI_readbit(void) {
+    bool bit;
+
     OWI_setlow();
     Delay_Us(6); // AN126
     OWI_sethigh();
     Delay_Us(9); // AN126
-    if(OWI_sample()) {
-        bit=1;
+
+    if (OWI_sample()) {
+        bit = true;
     } else {
-        bit=0;
+        bit = false;
     }
     Delay_Us(55); // AN126
 
@@ -72,33 +87,35 @@ uint8_t OWI_readbit(void) {
 }
 
 uint8_t OWI_readbyte(void) {
-    uint8_t val=0;
-    val|=(OWI_readbit()<<0);
-    val|=(OWI_readbit()<<1);
-    val|=(OWI_readbit()<<2);
-    val|=(OWI_readbit()<<3);
-    val|=(OWI_readbit()<<4);
-    val|=(OWI_readbit()<<5);
-    val|=(OWI_readbit()<<6);
-    val|=(OWI_readbit()<<7);
-    return val;
+    uint8_t byte = 0;
+
+    byte |= OWI_readbit() ? 0x01 : 0;
+    byte |= OWI_readbit() ? 0x02 : 0;
+    byte |= OWI_readbit() ? 0x04 : 0;
+    byte |= OWI_readbit() ? 0x08 : 0;
+    byte |= OWI_readbit() ? 0x10 : 0;
+    byte |= OWI_readbit() ? 0x20 : 0;
+    byte |= OWI_readbit() ? 0x40 : 0;
+    byte |= OWI_readbit() ? 0x80 : 0;
+
+    return byte;
 }
 
 void OWI_writebyte(uint8_t byte) {
-    OWI_writebit(byte&0x01);
-    OWI_writebit(byte&0x02);
-    OWI_writebit(byte&0x04);
-    OWI_writebit(byte&0x08);
-    OWI_writebit(byte&0x10);
-    OWI_writebit(byte&0x20);
-    OWI_writebit(byte&0x40);
-    OWI_writebit(byte&0x80);
+    OWI_writebit(byte & 0x01);
+    OWI_writebit(byte & 0x02);
+    OWI_writebit(byte & 0x04);
+    OWI_writebit(byte & 0x08);
+    OWI_writebit(byte & 0x10);
+    OWI_writebit(byte & 0x20);
+    OWI_writebit(byte & 0x40);
+    OWI_writebit(byte & 0x80);
 }
 
-uint8_t OWI_checkcrc(uint8_t* data, uint8_t len) {
+uint8_t OWI_checkcrc(uint8_t* data, size_t len) {
     uint8_t crc = 0;
 
-    for(uint8_t i=0;i<len;i++) {
+    for(size_t i=0; i < len; i++) {
         crc = _crc_ibutton_update(crc, data[i]);
     }
 
@@ -112,7 +129,7 @@ void OWI_matchrom(OWI_address address) {
 
     OWI_writebyte(0x55);
 
-    for(uint8_t i=0;i<8;i++) {
+    for(size_t i=0; i < 8; i++) {
         OWI_writebyte(address_bytes[i]);
     }
 }
@@ -129,7 +146,8 @@ void OWI_DS18B20setresolution(OWI_address address, uint8_t res) {
 
     OWI_writebyte(0x00);
     OWI_writebyte(0x00);
-    OWI_writebyte(res<<5);
+
+    OWI_writebyte(res << 5);
 }
 
 /* request temperature measurement. request blocks until conversion complete */
@@ -138,7 +156,7 @@ void OWI_DS18B20convert(OWI_address address) {
 
     OWI_writebyte(0x44);
 
-    while(OWI_readbit()==0);
+    while(!OWI_readbit());
 }
 
 /* request temperature measurement. does not block */
@@ -149,8 +167,8 @@ void OWI_DS18B20startconvert(OWI_address address) {
 }
 
 /* is the previously selected device still busy? */
-uint8_t OWI_busy(void) {
-    return (OWI_readbit()==0);
+bool OWI_busy(void) {
+    return !OWI_readbit();
 }
 
 /* read temperature value from device to argument value
@@ -166,27 +184,29 @@ uint8_t OWI_DS18B20readtemp(OWI_address address, int16_t* value) {
         int16_t word;
     } data;
 
-    uint8_t crc=0;
+    uint8_t crc = 0;
 
-    for(uint8_t i=0;i<9;i++) {
-        uint8_t tmp=OWI_readbyte();
-        if(i<=2) {
-            data.byte[i]=tmp;
+    for(size_t i = 0; i < 9; i++) {
+        uint8_t tmp = OWI_readbyte();
+        if (i <= 2) {
+            data.byte[i] = tmp;
         }
-        crc=_crc_ibutton_update(crc,tmp);
+        crc = _crc_ibutton_update(crc, tmp);
     }
-    (*value)=data.word;
+
+    (*value) = data.word;
+
     return crc;
 }
 
-uint8_t OWI_searchrom(OWI_address* address, uint8_t lastDeviation) {
-    uint8_t currentBit = 1;
-    uint8_t newDeviation = 0;
+size_t OWI_searchrom(OWI_address* address, size_t lastDeviation) {
+    size_t currentBit = 1;
+    size_t newDeviation = 0;
     uint8_t bitMask = 0x01;
     uint8_t bitA;
     uint8_t bitB;
 
-    uint8_t* bits=(uint8_t*)address;
+    uint8_t* bits = (uint8_t*)address;
 
     OWI_reset();
 
@@ -196,14 +216,13 @@ uint8_t OWI_searchrom(OWI_address* address, uint8_t lastDeviation) {
     // Walk through all 64 bits.
     while (currentBit <= 64) {
         // Read bit from bus twice.
-        bitA = OWI_readbit();
-        bitB = OWI_readbit();
+        bitA = OWI_readbit() ? 1 : 0;
+        bitB = OWI_readbit() ? 1 : 0;
 
         if (bitA && bitB) {
             // Both bits 1 (Error).
             return 0xff;
-        }
-        else if (bitA ^ bitB) {
+        } else if (bitA ^ bitB) {
             // Bits A and B are different. All devices have the same bit here.
             // Set the bit in bitPattern to this value.
             if (bitA) {
@@ -235,9 +254,9 @@ uint8_t OWI_searchrom(OWI_address* address, uint8_t lastDeviation) {
 
         // Send the selected bit to the bus.
         if ((*bits) & bitMask) {
-            OWI_writebit(1);
+            OWI_writebit(true);
         } else {
-            OWI_writebit(0);
+            OWI_writebit(false);
         }
 
         // Increment current bit.
@@ -250,25 +269,29 @@ uint8_t OWI_searchrom(OWI_address* address, uint8_t lastDeviation) {
             bits++;
         }
     }
+
     return newDeviation;
 }
 
-uint8_t OWI_find_devices(OWI_address* device, uint8_t devcount_max) {
-    /* check if there is even a single device connected */
-    uint8_t presence=OWI_reset();
-    if(!presence) {
+size_t OWI_find_devices(OWI_address* device, size_t devices_max) {
+    // check if there is even a single device connected
+    bool presence = OWI_reset();
+
+    if (!presence) {
+        // no devices on bus
         return 0;
     } else {
-        /* there is at least one device */
-        /* search for all connected 1-wire devices */
-        uint8_t devices=0;
-        uint8_t lastDeviation=0;
+        // at least one device
+
+        // search for all connected 1-wire devices
+        size_t devices = 0;
+        size_t lastDeviation = 0;
 
         do {
             OWI_reset();
-            lastDeviation=OWI_searchrom(&(device[devices]),lastDeviation);
+            lastDeviation = OWI_searchrom(&(device[devices]), lastDeviation);
             devices++;
-        } while(lastDeviation && devices<devcount_max);
+        } while(lastDeviation && devices < devices_max);
 
         return devices;
     }
