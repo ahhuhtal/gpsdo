@@ -384,7 +384,7 @@ int main() {
      * The OCXO response is of the form:
      * frequency_ocxo = control_word / ocxo_gain + frequency_offset
      */
-    const float ocxo_gain = 2000.0f;
+    const float ocxo_gain = 4363.0f;
 
     const float time_scale_fll = 1.0f / 32.0f;
     const float time_scale_pll_fast = 1.0f / 128.0f;
