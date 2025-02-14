@@ -504,7 +504,7 @@ int main() {
                     phase_err_filt_integral_err = (new_phase_err_filt_integral - phase_err_filt_integral) - phase_err_filt_corrected;
                     phase_err_filt_integral = new_phase_err_filt_integral;
 
-                    phase_err_filt += alpha_pll_fast * (phase_err - phase_err_filt);
+                    phase_err_filt += alpha_pll_fast * (phase_err - 0.5f - phase_err_filt);
 
                     float control = p_pll_fast * phase_err_filt + i_pll_fast * phase_err_filt_integral;
 
@@ -535,7 +535,7 @@ int main() {
                     phase_err_filt_integral_err = (new_phase_err_filt_integral - phase_err_filt_integral) - phase_err_filt_corrected;
                     phase_err_filt_integral = new_phase_err_filt_integral;
 
-                    phase_err_filt += alpha_pll_slow * (phase_err - phase_err_filt);
+                    phase_err_filt += alpha_pll_slow * (phase_err - 0.5f - phase_err_filt);
 
                     if (phase_err_filt > 127.0f || phase_err_filt < -128.0f) {
                         state = 0;
