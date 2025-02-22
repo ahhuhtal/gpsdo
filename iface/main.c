@@ -1,5 +1,3 @@
-#include "ch32v003fun.h"
-
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -8,6 +6,8 @@
 
 #include "unixtime.h"
 #include "i2c.h"
+
+#include "ch32fun.h"
 
 /**
  * GPSDO GNSS data interface implementation

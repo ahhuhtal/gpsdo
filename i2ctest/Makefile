@@ -1,13 +1,12 @@
 all: main.elf
 
-CH32V003FUN:=../ch32v003fun/ch32v003fun
-MINICHLINK:=../ch32v003fun/minichlink
+TARGET_MCU:=CH32V003
 
 TARGET:=main
 EXTRA_CFLAGS:=-I../common/
 ADDITIONAL_C_FILES:=../common/i2c.c
 
-include $(CH32V003FUN)/ch32v003fun.mk
+include ../ch32v003fun/ch32fun/ch32fun.mk
 
 flash: cv_flash
 clean: cv_clean

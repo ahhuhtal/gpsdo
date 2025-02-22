@@ -4,7 +4,7 @@
 
 #include "owi.h"
 
-#include "ch32v003fun.h"
+#include "ch32fun.h"
 
 /**
  * Lazy implementation of Dallas 1-wire interface.

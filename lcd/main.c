@@ -5,7 +5,7 @@
 #include "i2c.h"
 #include "unixtime.h"
 
-#include "ch32v003fun.h"
+#include "ch32fun.h"
 
 int mini_vsnprintf(char *buffer, unsigned int buffer_len, const char *fmt, va_list va);
 

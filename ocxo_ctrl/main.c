@@ -2,10 +2,10 @@
 #include <stdarg.h>
 #include <stdbool.h>
 
-#include "ch32v003fun.h"
-
 #include "owi.h"
 #include "i2c.h"
+
+#include "ch32fun.h"
 
 const uint16_t control_default = 32768; // control zero value
 
