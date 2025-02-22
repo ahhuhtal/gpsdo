@@ -320,6 +320,21 @@ void TIM1_CC_IRQHandler(void) {
         TIM1->INTFR = ~TIM_CC1IF;
     }
 }
+/**
+ * Kahan-Babushka summation.
+ * Given value a, where a = a_coarse + a_fine, compute a += b.
+ * @param a_coarse Pointer to coarse part of value a. Value is updated according to sum.
+ * @param a_fine Pointer to fine part of value a. Value is updated according to sum.
+ * @param b Value to add to a.
+ */
+void kahan_babushka_sum(float* a_coarse, float* a_fine, const float b) {
+    // See https://en.wikipedia.org/wiki/Kahan_summation_algorithm
+    const float fine_diff = b - (*a_fine);
+    const float sum_coarse = (*a_coarse) + fine_diff;
+
+    *a_fine = (sum_coarse - (*a_coarse)) - fine_diff;
+    *a_coarse = sum_coarse;
+}
 
 /**
  * Whether to build a normal binary CALIB = 0 or a calibration binary CALIB != 0
@@ -401,11 +416,15 @@ int main() {
     const float p_pll_slow = ocxo_gain * time_scale_pll_slow;
     const float i_pll_slow = ocxo_gain * time_scale_pll_slow * time_scale_pll_slow / 3.0f;
 
-    float freq_err_filt_integral = 0.0f / i_fll;
-    float freq_err_filt_integral_err = 0; // Kahan-Babushka error
+    // Frequency and phase error integrals grow slowly, but can be large in value.
+    // Single precision floating points do not have enough accuracy for long time scales.
 
-    float phase_err_filt_integral = 0;
-    float phase_err_filt_integral_err = 0; // Kahan-Babushka error
+    // Keep integrals as value = coarse + fine, and accumulate using Kahan-Babushka summation
+    float freq_err_filt_integral_coarse = 0.0f / i_fll;
+    float freq_err_filt_integral_fine = 0;
+
+    float phase_err_filt_integral_coarse = 0;
+    float phase_err_filt_integral_fine = 0;
 #endif
     uint8_t state = 0; // 0=FLL, 1=fast PLL, 2=slow PLL, 255=CALIB
     uint32_t state_count = 0; // time to transition to next state
@@ -462,15 +481,12 @@ int main() {
                 state_count++;
 #else
                 if (state == 0) {
-                    // Do Kahan-Babushka for: freq_err_filt_integral += freq_err_filt;
-                    float freq_err_filt_corrected = freq_err_filt - freq_err_filt_integral_err;
-                    float new_freq_err_filt_integral = freq_err_filt_integral + freq_err_filt_corrected;
-                    freq_err_filt_integral_err = (new_freq_err_filt_integral - freq_err_filt_integral) - freq_err_filt_corrected;
-                    freq_err_filt_integral = new_freq_err_filt_integral;
+                    // Compute freq_err_filt_integral += freq_err_filt
+                    kahan_babushka_sum(&freq_err_filt_integral_coarse, &freq_err_filt_integral_fine, freq_err_filt);
 
                     freq_err_filt += alpha_fll * (freq_err - freq_err_filt);
 
-                    float control = i_fll * freq_err_filt_integral;
+                    float control = i_fll * freq_err_filt_integral_coarse;
 
                     if (control > 32767.0f) {
                         control = 32767.0f;
@@ -487,8 +503,8 @@ int main() {
                         state_count = 0;
 
                         // seamless hand over to fast PLL
-                        phase_err_filt_integral = control / i_pll_fast;
-                        phase_err_filt_integral_err = freq_err_filt_integral_err * i_fll / i_pll_fast;
+                        phase_err_filt_integral_coarse = control / i_pll_fast;
+                        phase_err_filt_integral_fine = freq_err_filt_integral_fine * i_fll / i_pll_fast;
                     }
 
                     // constantly reset phase error in FLL mode
@@ -497,16 +513,12 @@ int main() {
                     phase_err_filt = 0;
                 } else if (state == 1) {
                     freq_err_filt += alpha_pll_fast * (freq_err - freq_err_filt);
-
-                    // Do Kahan-Babushka for: phase_err_filt_integral += phase_err_filt;
-                    float phase_err_filt_corrected = phase_err_filt - phase_err_filt_integral_err;
-                    float new_phase_err_filt_integral = phase_err_filt_integral + phase_err_filt_corrected;
-                    phase_err_filt_integral_err = (new_phase_err_filt_integral - phase_err_filt_integral) - phase_err_filt_corrected;
-                    phase_err_filt_integral = new_phase_err_filt_integral;
-
                     phase_err_filt += alpha_pll_fast * (phase_err - 0.5f - phase_err_filt);
 
-                    float control = p_pll_fast * phase_err_filt + i_pll_fast * phase_err_filt_integral;
+                    // Compute phase_err_filt_integral += phase_err_filt
+                    kahan_babushka_sum(&phase_err_filt_integral_coarse, &phase_err_filt_integral_fine, phase_err_filt);
+
+                    float control = p_pll_fast * phase_err_filt + i_pll_fast * phase_err_filt_integral_coarse;
 
                     if (control > 32767.0f) {
                         control = 32767.0f;
@@ -523,25 +535,21 @@ int main() {
                         state_count = 0;
 
                         // seamless hand over to slow PLL
-                        phase_err_filt_integral = (control - p_pll_slow * phase_err_filt) / i_pll_slow;
-                        phase_err_filt_integral_err = phase_err_filt_integral_err * i_pll_fast / i_pll_slow;
+                        phase_err_filt_integral_coarse = (control - p_pll_slow * phase_err_filt) / i_pll_slow;
+                        phase_err_filt_integral_fine = phase_err_filt_integral_fine * i_pll_fast / i_pll_slow;
                     }
                 } else {
                     freq_err_filt += alpha_pll_slow * (freq_err - freq_err_filt);
-
-                    // Do Kahan-Babushka for: phase_err_filt_integral += phase_err_filt;
-                    float phase_err_filt_corrected = phase_err_filt - phase_err_filt_integral_err;
-                    float new_phase_err_filt_integral = phase_err_filt_integral + phase_err_filt_corrected;
-                    phase_err_filt_integral_err = (new_phase_err_filt_integral - phase_err_filt_integral) - phase_err_filt_corrected;
-                    phase_err_filt_integral = new_phase_err_filt_integral;
-
                     phase_err_filt += alpha_pll_slow * (phase_err - 0.5f - phase_err_filt);
+
+                    // Compute phase_err_filt_integral += phase_err_filt
+                    kahan_babushka_sum(&phase_err_filt_integral_coarse, &phase_err_filt_integral_fine, phase_err_filt);
 
                     if (phase_err_filt > 127.0f || phase_err_filt < -128.0f) {
                         state = 0;
                     }
 
-                    float control = p_pll_slow * phase_err_filt + i_pll_slow * phase_err_filt_integral;
+                    float control = p_pll_slow * phase_err_filt + i_pll_slow * phase_err_filt_integral_coarse;
 
                     if (control > 32767.0f) {
                         control = 32767.0f;
