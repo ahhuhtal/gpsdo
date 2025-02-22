@@ -1,0 +1,7 @@
+*.elf
+*.hex
+*.lst
+*.map
+*.bin
+.vscode/settings.json
+*.csv
