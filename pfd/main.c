@@ -2,8 +2,6 @@
 #include <stdarg.h>
 #include <stdbool.h>
 
-#include <string.h>
-
 #include "ch32v003fun.h"
 
 #include "i2c.h"
@@ -320,6 +318,67 @@ void TIM1_CC_IRQHandler(void) {
         TIM1->INTFR = ~TIM_CC1IF;
     }
 }
+
+/**
+ * Simple round function (does not support large values)
+ * Implement here to omit need for standard math library.
+ * @param value Value to round to nearest integer
+ * @returns Rounded value
+ */
+float roundf(float value) {
+    if (value >= 0.0f) {
+        return (float)((int)(value + 0.5f));
+    }
+
+    return (float)((int)(value - 0.5f));
+}
+
+/**
+ * Correct bias in averaged phase error
+ * @param phase_err_avg Average of phase error
+ * @returns Bias-corrected phase error
+ */
+float correct_phase_error_bias(float phase_err_avg) {
+    // Interpolant data for bias correction
+    const size_t N = 32;
+    const float avg_fract[32] = {
+        -0.50000000, -0.49999855, -0.49999334, -0.49997238,
+        -0.49989624, -0.49964682, -0.49890989, -0.49694608,
+        -0.49222597, -0.48199322, -0.46198443, -0.42669537,
+        -0.37055789, -0.29000875, -0.18576128, -0.06406763,
+         0.06406763,  0.18576128,  0.29000875,  0.37055789,
+         0.42669537,  0.46198443,  0.48199322,  0.49222597,
+         0.49694608,  0.49890989,  0.49964682,  0.49989624,
+         0.49997238,  0.49999334,  0.49999855,  0.50000000
+    };
+    const float true_fract[32] = {
+        -0.50000000, -0.46774194, -0.43548387, -0.40322581,
+        -0.37096774, -0.33870968, -0.30645161, -0.27419355,
+        -0.24193548, -0.20967742, -0.17741935, -0.14516129,
+        -0.11290323, -0.08064516, -0.04838710, -0.01612903,
+         0.01612903,  0.04838710,  0.08064516,  0.11290323,
+         0.14516129,  0.17741935,  0.20967742,  0.24193548,
+         0.27419355,  0.30645161,  0.33870968,  0.37096774,
+         0.40322581,  0.43548387,  0.46774194,  0.50000000
+    };
+
+    const float phase_err_round = roundf(phase_err_avg);
+    const float phase_err_avg_fract = phase_err_avg - phase_err_round;
+
+    if (phase_err_avg_fract <= avg_fract[0]) {
+        return phase_err_round + true_fract[0];
+    }
+
+    for (size_t i = 1; i < N; i++) {
+        if (phase_err_avg_fract <= avg_fract[i]) {
+            const float c = (phase_err_avg_fract - avg_fract[i - 1]) / (avg_fract[i] - avg_fract[i - 1]);
+            return phase_err_round + (1.0f - c) * true_fract[i - 1] + c * true_fract[i];
+        }
+    }
+
+    return phase_err_round + true_fract[N-1];
+}
+
 /**
  * Kahan-Babushka summation.
  * Given value a, where a = a_coarse + a_fine, compute a += b.
@@ -567,7 +626,9 @@ int main() {
                 last_frequency_error_filtered = freq_err_filt * 16777216.0f;
 
                 last_phase_error_raw = phase_err;
-                last_phase_error_filtered = phase_err_filt * 16777216.0f;
+
+                const float phase_err_filt_true = correct_phase_error_bias(phase_err_filt);
+                last_phase_error_filtered = phase_err_filt_true * 16777216.0f;
 
                 last_tick_valid = tick_pps;
 
