@@ -46,11 +46,8 @@
  * The PPS pulses need to be additionally validated against
  * erroneous pulses arriving from the GNSS receiver unit
  *
- * The PLL controller here is a single parameter PI controller
- * with error signal low-pass filtering.
- * See https://kiedontaa.blogspot.com/2024/07/single-parameter-controller-for-gps.html
- *
- * The FLL controller follows the same idea
+ * Controllers use long time averages to obtain good measurements of frequency
+ * and phase errors. The control itself is then simple, but quite agressive.
  */
 
 // tick counter high bits [63:16], bits 15:0 always 0.
@@ -58,8 +55,6 @@ volatile uint64_t tick_high = 0;
 
 // tick value of last PPS pulse
 volatile uint64_t last_tick_pps;
-// tick difference between two last PPS pulses
-volatile int last_difftick_pps;
 // was the last PPS pulse valid
 volatile bool last_valid_pps = false;
 
@@ -142,35 +137,35 @@ void rx_done_callback(void) {
  * The variables below represent the latest values to be transmitted.
  * These values are used to construct the I2C transfer data when requested.
  */
-volatile int32_t last_phase_error_raw; // raw phase error, 50 ns res.
-volatile int32_t last_phase_error_filtered; // filtered phase error, 3.0 fs res.
-volatile int32_t last_frequency_error_raw; // raw frequency error, 0.5 Hz res.
-volatile int32_t last_frequency_error_filtered; // filtered phase error, 29.8 nHz res.
-volatile uint64_t last_tick_valid; // tick of latest OCXO control update
-volatile uint16_t last_ocxo_control_word; // last OCXO control word
-volatile uint8_t last_control_mode; // controller mode at last update, 0=FLL, 1=fast PLL, 2=slow PLL
+volatile int32_t ui_phase_error_raw; // raw phase error after a cycle, 3.0 fs res.
+volatile int32_t ui_phase_error_filtered; // filtered phase error, 3.0 fs res.
+volatile int32_t ui_frequency_error_raw; // raw frequency error after a cycle, 29.8 nHz res.
+volatile int32_t ui_frequency_error_filtered; // filtered phase error, 29.8 nHz res.
+volatile uint64_t ui_tick_valid; // tick of latest OCXO control update
+volatile int16_t ui_ocxo_control_word; // last OCXO control word
+volatile uint8_t ui_control_mode; // controller mode at last update, 0=FLL, 1=PLL
 
 // data structure for pulling data from us
 volatile struct {
-    int32_t phase_error_raw; // deviation from UTC second, LSB = 50 ns
+    int32_t phase_error_raw; // Q7.24, LSB ~= 3.0 fs
     int32_t phase_error_filtered; // Q7.24, LSB ~= 3.0 fs
-    int32_t frequecy_error_raw; // OCXO frequency error, LSB = 0.5 Hz
+    int32_t frequecy_error_raw; // Q7.24, LSB ~= 29.8 nHz
     int32_t frequency_error_filtered; // Q7.24, LSB ~= 29.8 nHz
     uint32_t time_since_valid; // How many seconds since last control update (i.e. since valid GPS data)
     int16_t ocxo_control_word; // OCXO control word
-    uint8_t control_mode; // Which control mode are we in 0=FLL, 1=fast PLL, 2=slow PLL
+    uint8_t control_mode; // Which control mode are we in 0=FLL, 1=PLL
 } __attribute__((packed)) tx_data_buf;
 
 // called when someone wants to pull data from us
 void tx_start_callback(void) {
     // double buffer the data so that it changes atomically
-    tx_data_buf.phase_error_raw = last_phase_error_raw;
-    tx_data_buf.phase_error_filtered = last_phase_error_filtered;
-    tx_data_buf.frequecy_error_raw = last_frequency_error_raw;
-    tx_data_buf.frequency_error_filtered = last_frequency_error_filtered;
-    tx_data_buf.time_since_valid = (get_current_tick() - last_tick_valid) / 20000000UL;
-    tx_data_buf.ocxo_control_word = last_ocxo_control_word;
-    tx_data_buf.control_mode = last_control_mode;
+    tx_data_buf.phase_error_raw = ui_phase_error_raw;
+    tx_data_buf.phase_error_filtered = ui_phase_error_filtered;
+    tx_data_buf.frequecy_error_raw = ui_frequency_error_raw;
+    tx_data_buf.frequency_error_filtered = ui_frequency_error_filtered;
+    tx_data_buf.time_since_valid = (get_current_tick() - ui_tick_valid) / 20000000UL;
+    tx_data_buf.ocxo_control_word = ui_ocxo_control_word;
+    tx_data_buf.control_mode = ui_control_mode;
 }
 
 // tick count for producing the next PPS output
@@ -272,7 +267,7 @@ void TIM1_CC_IRQHandler(void) {
         }
 
         // compute the number of ticks since the last input PPS
-        last_difftick_pps = new_tick - last_tick_pps;
+        const int last_difftick_pps = new_tick - last_tick_pps;
         // update latest input PPS tick time
         last_tick_pps = new_tick;
 
@@ -334,11 +329,13 @@ float roundf(float value) {
 }
 
 /**
- * Correct bias in averaged phase error
- * @param phase_err_avg Average of phase error
- * @returns Bias-corrected phase error
+ * Estimate phase error from averaged tick error.
+ * Phase is given in number of ticks, but corrected for the sampling bias and
+ * with phase 0 occurring at tick_error_average = 0.5.
+ * @param tick_error Average of tick error
+ * @returns Estimated phase error
  */
-float correct_phase_error_bias(float phase_err_avg) {
+float estimate_phase_error(const float tick_error) {
     // Interpolant data for bias correction
     const size_t N = 32;
     const float avg_fract[32] = {
@@ -351,7 +348,7 @@ float correct_phase_error_bias(float phase_err_avg) {
          0.49694608,  0.49890989,  0.49964682,  0.49989624,
          0.49997238,  0.49999334,  0.49999855,  0.50000000
     };
-    const float true_fract[32] = {
+    const float phase_fract[32] = {
         -0.50000000, -0.46774194, -0.43548387, -0.40322581,
         -0.37096774, -0.33870968, -0.30645161, -0.27419355,
         -0.24193548, -0.20967742, -0.17741935, -0.14516129,
@@ -362,21 +359,22 @@ float correct_phase_error_bias(float phase_err_avg) {
          0.40322581,  0.43548387,  0.46774194,  0.50000000
     };
 
-    const float phase_err_round = roundf(phase_err_avg);
-    const float phase_err_avg_fract = phase_err_avg - phase_err_round;
+    const float tick_error_round = roundf(tick_error - 0.5f);
+    const float tick_error_fract = tick_error - 0.5f - tick_error_round;
 
-    if (phase_err_avg_fract <= avg_fract[0]) {
-        return phase_err_round + true_fract[0];
+    // lookup the phase error in the table with linear interpolation
+    if (tick_error_fract <= avg_fract[0]) {
+        return tick_error_round + phase_fract[0];
     }
 
     for (size_t i = 1; i < N; i++) {
-        if (phase_err_avg_fract <= avg_fract[i]) {
-            const float c = (phase_err_avg_fract - avg_fract[i - 1]) / (avg_fract[i] - avg_fract[i - 1]);
-            return phase_err_round + (1.0f - c) * true_fract[i - 1] + c * true_fract[i];
+        if (tick_error_fract <= avg_fract[i]) {
+            const float c = (tick_error_fract - avg_fract[i - 1]) / (avg_fract[i] - avg_fract[i - 1]);
+            return tick_error_round + (1.0f - c) * phase_fract[i - 1] + c * phase_fract[i];
         }
     }
 
-    return phase_err_round + true_fract[N-1];
+    return tick_error_round + phase_fract[N-1];
 }
 
 /**
@@ -394,14 +392,6 @@ void kahan_babushka_sum(float* a_coarse, float* a_fine, const float b) {
     *a_fine = (sum_coarse - (*a_coarse)) - fine_diff;
     *a_coarse = sum_coarse;
 }
-
-/**
- * Whether to build a normal binary CALIB = 0 or a calibration binary CALIB != 0
- * A calibration binary will not run the controller, but instead
- * alternate between two control words, while measuring the frequency
- * This is useful for OCXO gain measurement.
- */
-#define CALIB 0
 
 int main() {
     SystemInit();
@@ -441,18 +431,6 @@ int main() {
     NVIC_EnableIRQ(TIM1_UP_IRQn); // Enable overflow interrupt
     NVIC_EnableIRQ(TIM1_CC_IRQn); // Enable CC interrupts
 
-    int16_t ocxo_control_word;
-    int64_t phase_offset = 0;
-
-    float freq_err_filt = 0;
-    float phase_err_filt = 0;
-
-#if CALIB
-    const int16_t control_0 = 18438 - 500;
-    const int16_t control_1 = 18438 + 500;
-
-    const float alpha = 1.0f / 256.0f;
-#else
     /**
      * OCXO control gain.
      * The OCXO response is of the form:
@@ -460,48 +438,65 @@ int main() {
      */
     const float ocxo_gain = 4363.0f;
 
-    const float time_scale_fll = 1.0f / 32.0f;
-    const float time_scale_pll_fast = 1.0f / 128.0f;
-    const float time_scale_pll_slow = 1.0f / 2048.0f;
+    /* FLL controller parameters */
+    const size_t tick_error_average_count_fll_start = 4; // how many tick_error samples to initially average in FLL
+    const size_t tick_error_average_count_fll_end = 512; // how many tick_error samples to at most average in FLL before switching to PLL
+    const float error_damping_factor_fll = 0.67f;
+    const float i_fll = ocxo_gain * error_damping_factor_fll;
 
-    const float alpha_fll = 2.0f * time_scale_fll;
-    const float i_fll = ocxo_gain * time_scale_fll / 2.0f;
-
-    const float alpha_pll_fast = 3.0f * time_scale_pll_fast;
-    const float p_pll_fast = ocxo_gain * time_scale_pll_fast;
-    const float i_pll_fast = ocxo_gain * time_scale_pll_fast * time_scale_pll_fast / 3.0f;
-
-    const float alpha_pll_slow = 3.0f * time_scale_pll_slow;
-    const float p_pll_slow = ocxo_gain * time_scale_pll_slow;
-    const float i_pll_slow = ocxo_gain * time_scale_pll_slow * time_scale_pll_slow / 3.0f;
+    /* PLL controller parameters */
+    const size_t tick_error_average_count_pll = 256; // how many tick_error samples to average PLL samples
+    const float error_damping_factor_pll = 0.125f;
+    const float p_pll = 2.0f * (ocxo_gain / tick_error_average_count_pll) * error_damping_factor_pll;
+    const float i_pll = (ocxo_gain / tick_error_average_count_pll) * error_damping_factor_pll * error_damping_factor_pll;
 
     // Frequency and phase error integrals grow slowly, but can be large in value.
     // Single precision floating points do not have enough accuracy for long time scales.
-
     // Keep integrals as value = coarse + fine, and accumulate using Kahan-Babushka summation
-    float freq_err_filt_integral_coarse = 0.0f / i_fll;
-    float freq_err_filt_integral_fine = 0;
+    float freq_error_integral_coarse = 0;
+    float freq_error_integral_fine = 0;
+    float phase_error_integral_coarse = 0;
+    float phase_error_integral_fine = 0;
 
-    float phase_err_filt_integral_coarse = 0;
-    float phase_err_filt_integral_fine = 0;
-#endif
-    uint8_t state = 0; // 0=FLL, 1=fast PLL, 2=slow PLL, 255=CALIB
+    /* Filtered frequency and phase errors for UI error display. */
+    float freq_error_filtered = 0;
+    float phase_error_filtered = 0;
+    float alpha = 1 / 8.0f; // low-pass filter damping factor for filtered errors
+
+    /* Phase and frequency sample averaging parameters */
+    size_t tick_error_average_count = tick_error_average_count_fll_start;
+    int tick_error_start = 0; // tick error at start of averaging period
+    int tick_error_sum = 0; // accumulated sum of tick error sample values
+    size_t tick_error_count = 0; // accumulated number of tick error samples
+
+    uint8_t state = 0; // 0=FLL, 1=PLL, 2=Free running
     uint32_t state_count = 0; // time to transition to next state
 
-    while(1) {
-        bool valid_pps;
-        uint64_t tick_pps;
+    int64_t tick_offset = 0; // tick offset to adjust initial tick error to 0
+    bool tick_offset_initialized = false; // has the tick offset been initialized
 
-        bool valid_timestamp;
-        uint64_t tick_timestamp;
-        uint32_t timestamp;
+
+    // make sure OCXO is at known state
+    ui_ocxo_control_word = -8192;
+    i2c_master_transfer(0x0c, &ui_ocxo_control_word, sizeof(ui_ocxo_control_word));
+
+    while(1) {
+        /*
+         * Poll for valid PPS and timestamp data.
+         */
+
+        bool valid_pps; // was the last PPS input pulse valid
+        uint64_t tick_pps; // when did we receive the last PPS input pulse
+
+        bool valid_timestamp; // was the last GNSS timestamp valid
+        uint64_t tick_timestamp; // when did we receive the last GNSS timestamp
+        uint32_t timestamp; // what was the last GNSS timestamp value
 
         __disable_irq(); // read the following data atomically
         valid_pps = last_valid_pps;
 
-        tick_pps = last_tick_pps;
-
         if (valid_pps) {
+            tick_pps = last_tick_pps;
             tick_timestamp = last_timestamp_tick;
             valid_timestamp = last_timestamp_valid;
             timestamp = last_timestamp;
@@ -512,146 +507,157 @@ int main() {
         }
         __enable_irq();
 
-        if(valid_pps && valid_timestamp) {
-            int64_t pps_timestamp_tick_diff = tick_pps - tick_timestamp;
+        if (!valid_pps || !valid_timestamp) {
+            // no valid PPS or timestamp data, wait for next cycle
+            continue;
+        }
 
-            if (pps_timestamp_tick_diff > 10000000UL && pps_timestamp_tick_diff < 20000000UL) {
-                // the received timestamp is for the previous second
-                timestamp++;
 
-                int64_t tick_abs = timestamp * 20000000LL;
 
-                int freq_err = 20000000 - last_difftick_pps;
-                int phase_err = tick_abs - tick_pps - phase_offset;
+        /*
+         * Validate received PPS and timestamp data compatiblity.
+         *
+         * The GNSS timestamp transmision takes a while, so the last timestamp
+         * received is nominally the absolute time of the previously received PPS pulse.
+         *
+         * Thus, after receiving the PPS, we check that the last timestamp arrived
+         * within a reasonable time in the past, i.e. not too far in the past,
+         * but not too recently either. To be exact, the time stamp must have occured:
+         *  - Later than 1 second in the past
+         *  - Earlier than 0.5 seconds in the past
+         */
 
-#if CALIB
-                state = 255;
-                freq_err_filt += alpha*(freq_err - freq_err_filt);
+        const int64_t pps_timestamp_tick_diff = tick_pps - tick_timestamp; // positive values are toward the past
 
-                phase_err = 0;
-                phase_err_filt = 0;
+        if (pps_timestamp_tick_diff > 20000000L || pps_timestamp_tick_diff < 10000000L) {
+            // the received timestamp is too far in the past or too recent, wait for next cycle
+            continue;
+        }
 
-                if ((state_count % 2048) < 1024) {
-                    ocxo_control_word = control_0;
-                } else {
-                    ocxo_control_word = control_1;
-                }
 
-                state_count++;
-#else
-                if (state == 0) {
-                    // Compute freq_err_filt_integral += freq_err_filt
-                    kahan_babushka_sum(&freq_err_filt_integral_coarse, &freq_err_filt_integral_fine, freq_err_filt);
 
-                    freq_err_filt += alpha_fll * (freq_err - freq_err_filt);
+        /*
+         * Compute tick error between GNSS and OCXO and accumulate it into an average
+         */
 
-                    float control = i_fll * freq_err_filt_integral_coarse;
+        // compute the absolute tick value of the PPS input pulse
+        const int64_t tick_pps_absolute = timestamp * 20000000LL;
 
-                    if (control > 32767.0f) {
-                        control = 32767.0f;
-                    }
-                    if (control < -32768.0f) {
-                        control = -32768.0f;
-                    }
+        if (!tick_offset_initialized) {
+            tick_offset_initialized = true;
+            // initialize tick_offset so that tick_error starts at 0
+            tick_offset = tick_pps_absolute - tick_pps;
+        }
 
-                    ocxo_control_word = control;
+        // compute the error between the last PPS input absolute tick and when it was observed
+        const int tick_error = tick_pps_absolute - tick_pps - tick_offset;
 
-                    state_count++;
-                    if(state_count >= 512) {
-                        state = 1;
-                        state_count = 0;
+        // Accumulate an average of the tick errors over an averaging period
+        tick_error_sum += tick_error;
+        tick_error_count++;
 
-                        // seamless hand over to fast PLL
-                        phase_err_filt_integral_coarse = control / i_pll_fast;
-                        phase_err_filt_integral_fine = freq_err_filt_integral_fine * i_fll / i_pll_fast;
-                    }
-
-                    // constantly reset phase error in FLL mode
-                    phase_offset = tick_abs - tick_pps;
-                    phase_err = 0;
-                    phase_err_filt = 0;
-                } else if (state == 1) {
-                    freq_err_filt += alpha_pll_fast * (freq_err - freq_err_filt);
-                    phase_err_filt += alpha_pll_fast * (phase_err - 0.5f - phase_err_filt);
-
-                    // Compute phase_err_filt_integral += phase_err_filt
-                    kahan_babushka_sum(&phase_err_filt_integral_coarse, &phase_err_filt_integral_fine, phase_err_filt);
-
-                    float control = p_pll_fast * phase_err_filt + i_pll_fast * phase_err_filt_integral_coarse;
-
-                    if (control > 32767.0f) {
-                        control = 32767.0f;
-                    }
-                    if (control < -32768.0f) {
-                        control = -32768.0f;
-                    }
-
-                    ocxo_control_word = control;
-
-                    state_count++;
-                    if(state_count >= 2048) {
-                        state = 2;
-                        state_count = 0;
-
-                        // seamless hand over to slow PLL
-                        phase_err_filt_integral_coarse = (control - p_pll_slow * phase_err_filt) / i_pll_slow;
-                        phase_err_filt_integral_fine = phase_err_filt_integral_fine * i_pll_fast / i_pll_slow;
-                    }
-                } else {
-                    freq_err_filt += alpha_pll_slow * (freq_err - freq_err_filt);
-                    phase_err_filt += alpha_pll_slow * (phase_err - 0.5f - phase_err_filt);
-
-                    // Compute phase_err_filt_integral += phase_err_filt
-                    kahan_babushka_sum(&phase_err_filt_integral_coarse, &phase_err_filt_integral_fine, phase_err_filt);
-
-                    if (phase_err_filt > 127.0f || phase_err_filt < -128.0f) {
-                        state = 0;
-                    }
-
-                    float control = p_pll_slow * phase_err_filt + i_pll_slow * phase_err_filt_integral_coarse;
-
-                    if (control > 32767.0f) {
-                        control = 32767.0f;
-                    }
-                    if (control < -32768.0f) {
-                        control = -32768.0f;
-                    }
-
-                    ocxo_control_word = control;
-                }
-#endif
-
-                i2c_acquire(); // don't allow i2c accesses while we update the following data
-                last_frequency_error_raw = freq_err;
-                last_frequency_error_filtered = freq_err_filt * 16777216.0f;
-
-                last_phase_error_raw = phase_err;
-
-                const float phase_err_filt_true = correct_phase_error_bias(phase_err_filt);
-                last_phase_error_filtered = phase_err_filt_true * 16777216.0f;
-
-                last_tick_valid = tick_pps;
-
-                last_ocxo_control_word = ocxo_control_word;
-
-                last_control_mode = state;
-                i2c_release();
-
-                __disable_irq();
-                next_pps_out_tick = tick_abs - phase_offset + 20000000;
-                __enable_irq();
-
-                if (i2c_master_done()) {
-                    i2c_master_transfer(0x0c, &last_ocxo_control_word, sizeof(last_ocxo_control_word));
-                }
+        // update latest tick validity, to report good status in UI
+        // note: this operation is atomic, so no need to acquire i2c
+        ui_tick_valid = tick_pps;
 
 #if (FUNCONF_USE_DEBUGPRINTF)
-                int freq_err_filt_scale = last_frequency_error_filtered * 1000LL / 16777216LL;
-                int phase_err_filt_scale = last_phase_error_filtered * 1000LL / 16777216LL;
+        const int freq_err_scale = ui_frequency_error_raw * 1000LL / 16777216LL;
+        const int phase_err_scale = ui_phase_error_raw * 1000LL / 16777216LL;
 
-                printf("%d, %lu, %d, %d, %d, %d, %d\n", state, timestamp, (int)last_frequency_error_raw, (int)freq_err_filt_scale, (int)last_phase_error_raw, (int)phase_err_filt_scale, (int)ocxo_control_word);
+        printf("%d, %lu, %d, %d, %d, %d, %d\n", state, timestamp, (int)tick_error_count, (int)freq_err_scale, (int)tick_error, (int)phase_err_scale, (int)ui_ocxo_control_word);
 #endif
+
+
+        if (tick_error_count < tick_error_average_count) {
+            // not enough samples yet, wait for next cycle
+            continue;
+        }
+
+
+
+        /*
+         * Compute phase error estimate from averaged tick error
+         */
+
+        const float tick_error_average = (float)tick_error_sum / (float)tick_error_average_count;
+        const float freq_error = (tick_error - tick_error_start) / (float)tick_error_average_count;
+        const float phase_error = estimate_phase_error(tick_error_average);
+
+        freq_error_filtered += alpha * (freq_error - freq_error_filtered);
+        phase_error_filtered += alpha * (phase_error - phase_error_filtered);
+
+        float control = 0.0f;
+
+        state_count++;
+
+        if (state == 0) {
+            // Compute freq_error_integral += freq_err
+            kahan_babushka_sum(&freq_error_integral_coarse, &freq_error_integral_fine, freq_error);
+
+            control = i_fll * freq_error_integral_coarse;
+
+            if (tick_error - tick_error_start >= -2 && tick_error - tick_error_start <= 2) {
+                // increase averaging time for next cycle to improve resolution
+                tick_error_average_count *= 2;
             }
+
+            if (tick_error_average_count > tick_error_average_count_fll_end) {
+                // switch to PLL
+                state = 1;
+                state_count = 0;
+
+                // switch to PLL averaging
+                tick_error_average_count = tick_error_average_count_pll;
+
+                // reset tick error to zero
+                tick_offset = tick_pps_absolute - tick_pps;
+
+                // seamless hand over to PLL
+                phase_error_integral_coarse = control / i_pll;
+                phase_error_integral_fine = freq_error_integral_fine * i_fll / i_pll;
+            }
+        } else if (state == 1) {
+            // Compute phase_error_integral += phase_error
+            kahan_babushka_sum(&phase_error_integral_coarse, &phase_error_integral_fine, phase_error);
+
+            control = p_pll * phase_error + i_pll * phase_error_integral_coarse;
+        } else if (state == 2) {
+            // free running, no control
+            control = -8192.0f;
+        }
+
+        if (control > 32767.0f) {
+            control = 32767.0f;
+        }
+        if (control < -32768.0f) {
+            control = -32768.0f;
+        }
+
+        // get ready to accumulate next period
+        tick_error_sum = 0;
+        tick_error_count = 0;
+        tick_error_start = tick_error;
+
+        const int16_t ocxo_control_word = control;
+
+        i2c_acquire(); // don't allow i2c accesses while we update the following data
+
+        ui_frequency_error_raw = freq_error * 16777216.0f;
+        ui_phase_error_raw = phase_error * 16777216.0f;
+        ui_frequency_error_filtered = freq_error_filtered * 16777216.0f;
+        ui_phase_error_filtered = phase_error_filtered * 16777216.0f;
+
+        ui_ocxo_control_word = ocxo_control_word;
+
+        ui_control_mode = state;
+        i2c_release();
+
+        __disable_irq();
+        next_pps_out_tick = tick_pps_absolute - tick_offset + 20000000;
+        __enable_irq();
+
+        if (i2c_master_done()) {
+            i2c_master_transfer(0x0c, &ui_ocxo_control_word, sizeof(ui_ocxo_control_word));
         }
     }
 }
