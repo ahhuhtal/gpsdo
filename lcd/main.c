@@ -310,9 +310,9 @@ int main() {
 
     // data structure fetched from PLL controller
     volatile struct __attribute__((packed)) {
-        int32_t phase_error_raw; // deviation from UTC second, LSB = 50 ns
+        int32_t phase_error_raw; // Q7.24, LSB ~= 3.0 fs
         int32_t phase_error_filtered; // Q7.24, LSB ~= 3.0 fs
-        int32_t frequecy_error_raw; // OCXO frequency error, LSB = 0.5 Hz
+        int32_t frequecy_error_raw; // Q7.24, LSB ~= 29.8 nHz
         int32_t frequency_error_filtered; // Q7.24, LSB ~= 29.8 nHz
         uint32_t time_since_valid; // How many seconds since last control update (i.e. since valid GPS data)
         int16_t ocxo_control_word; // OCXO control word
