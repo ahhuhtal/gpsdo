@@ -46,8 +46,22 @@
  * The PPS pulses need to be additionally validated against
  * erroneous pulses arriving from the GNSS receiver unit
  *
- * Controllers use long time averages to obtain good measurements of frequency
- * and phase errors. The control itself is then simple, but quite agressive.
+ * Two controllers are implemented: a frequency-locked loop (FLL)
+ * controller and a phase-locked loop (PLL) controller.
+ *
+ * Both controllers average the observed tick error over a number of PPS
+ * pulses. From the averaged tick error, a phase error estimate is derived.
+ * See https://kiedontaa.blogspot.com/2025/02/on-quantization-errors-and-recovering.html
+ * A frequency error estimate is also derived based on the change of the phase error.
+ *
+ * The FLL controller is used first to tune the OCXO frequency.
+ * The FLL starts out with a short averaging period to achieve a quick
+ * coarse adjustment of the frequency, and then gradually increases
+ * the averaging period to improve the resolution of the frequency error.
+ *
+ * Once the FLL has converged to a good frequency, a target phase value is sampled
+ * and the control is switched to a PLL controller. The PLL controller is based on
+ * https://kiedontaa.blogspot.com/2024/07/single-parameter-controller-for-gps.html
  */
 
 // tick counter high bits [63:16], bits 15:0 always 0.
@@ -315,38 +329,45 @@ void TIM1_CC_IRQHandler(void) {
 }
 
 /**
- * Simple round function (does not support large values)
+ * Simple floor function (does not support large values)
  * Implement here to omit need for standard math library.
- * @param value Value to round to nearest integer
- * @returns Rounded value
+ * @param value Value to round down to nearest integer
+ * @returns Floored value
  */
-float roundf(float value) {
-    if (value >= 0.0f) {
-        return (float)((int)(value + 0.5f));
+float floorf(float value) {
+    if (value == (float)((int)value)) {
+        return value; // already an integer
     }
 
-    return (float)((int)(value - 0.5f));
-}
+    if (value > 0.0f) {
+        return (float)((int)value); // positive value, just truncate
+    }
 
+    return (float)((int)value - 1); // negative value, truncate and subtract one
+}
 /**
  * Estimate phase error from averaged tick error.
  * Phase is given in number of ticks, but corrected for the sampling bias and
  * with phase 0 occurring at tick_error_average = 0.5.
+ * See https://kiedontaa.blogspot.com/2025/02/on-quantization-errors-and-recovering.html
  * @param tick_error Average of tick error
  * @returns Estimated phase error
  */
 float estimate_phase_error(const float tick_error) {
-    // Interpolant data for bias correction
+    /*
+     * Interpolant data for bias correction.
+     * Table below is derived for 4.5 nanoseconds RMS phase jitter using sw/support/phase_error.py script.
+     */
     const size_t N = 32;
     const float avg_fract[32] = {
-        -0.50000000, -0.49999855, -0.49999334, -0.49997238,
-        -0.49989624, -0.49964682, -0.49890989, -0.49694608,
-        -0.49222597, -0.48199322, -0.46198443, -0.42669537,
-        -0.37055789, -0.29000875, -0.18576128, -0.06406763,
-         0.06406763,  0.18576128,  0.29000875,  0.37055789,
-         0.42669537,  0.46198443,  0.48199322,  0.49222597,
-         0.49694608,  0.49890989,  0.49964682,  0.49989624,
-         0.49997238,  0.49999334,  0.49999855,  0.50000000
+        0.00000000e+00, 8.73564864e-08, 6.39587402e-07, 3.71330501e-06,
+        1.87771334e-05, 8.37818527e-05, 3.30784732e-04, 1.15723290e-03,
+        3.59220477e-03, 9.90969424e-03, 2.43432771e-02, 5.33827548e-02,
+        1.04833732e-01, 1.85111059e-01, 2.95414730e-01, 4.28885827e-01,
+        5.71114173e-01, 7.04585270e-01, 8.14888941e-01, 8.95166268e-01,
+        9.46617245e-01, 9.75656723e-01, 9.90090306e-01, 9.96407795e-01,
+        9.98842767e-01, 9.99669215e-01, 9.99916218e-01, 9.99981223e-01,
+        9.99996287e-01, 9.99999360e-01, 9.99999913e-01, 1.00000000e+00
     };
     const float phase_fract[32] = {
         -0.50000000, -0.46774194, -0.43548387, -0.40322581,
@@ -359,22 +380,26 @@ float estimate_phase_error(const float tick_error) {
          0.40322581,  0.43548387,  0.46774194,  0.50000000
     };
 
-    const float tick_error_round = roundf(tick_error - 0.5f);
-    const float tick_error_fract = tick_error - 0.5f - tick_error_round;
+    const float tick_error_floor = floorf(tick_error);
+    const float tick_error_fract = tick_error - tick_error_floor;
 
     // lookup the phase error in the table with linear interpolation
+
+    // value is below the first entry, return the first entry
     if (tick_error_fract <= avg_fract[0]) {
-        return tick_error_round + phase_fract[0];
+        return tick_error_floor + phase_fract[0];
     }
 
+    // try to find the right entry in the table
     for (size_t i = 1; i < N; i++) {
         if (tick_error_fract <= avg_fract[i]) {
             const float c = (tick_error_fract - avg_fract[i - 1]) / (avg_fract[i] - avg_fract[i - 1]);
-            return tick_error_round + (1.0f - c) * phase_fract[i - 1] + c * phase_fract[i];
+            return tick_error_floor + (1.0f - c) * phase_fract[i - 1] + c * phase_fract[i];
         }
     }
 
-    return tick_error_round + phase_fract[N-1];
+    // value is above the last entry, return the last entry
+    return tick_error_floor + phase_fract[N-1];
 }
 
 /**
@@ -431,6 +456,23 @@ int main() {
     NVIC_EnableIRQ(TIM1_UP_IRQn); // Enable overflow interrupt
     NVIC_EnableIRQ(TIM1_CC_IRQn); // Enable CC interrupts
 
+    /* General state variables */
+    uint8_t state = 0; // 0=FLL, 1=PLL, 2=Free running
+    int64_t tick_offset = 0; // tick offset to adjust initial tick error to 0
+    bool tick_offset_initialized = false; // has the tick offset been initialized
+
+    /* Phase and frequency sample averaging parameters */
+    const size_t tick_error_average_count_fll_start = 4; // how many tick_error samples to initially average in FLL
+    const size_t tick_error_average_count_fll_end = 256; // how many tick_error samples to at most average in FLL before switching to PLL
+    const size_t tick_error_average_count_pll = 8; // how many tick_error samples to average in PLL
+
+    // number of tick error samples to average
+    size_t tick_error_average_count = tick_error_average_count_fll_start;
+
+    int tick_error_sum = 0; // accumulated sum of tick error sample values
+    float phase_error_start = 0; // phase error at start of averaging period
+    size_t tick_error_count = 0; // accumulated number of tick error samples
+
     /**
      * OCXO control gain.
      * The OCXO response is of the form:
@@ -438,46 +480,34 @@ int main() {
      */
     const float ocxo_gain = 4363.0f;
 
-    /* FLL controller parameters */
-    const size_t tick_error_average_count_fll_start = 4; // how many tick_error samples to initially average in FLL
-    const size_t tick_error_average_count_fll_end = 512; // how many tick_error samples to at most average in FLL before switching to PLL
-    const float error_damping_factor_fll = 0.67f;
-    const float i_fll = ocxo_gain * error_damping_factor_fll;
+    /* Filtered frequency and phase errors */
+    float alpha = 1 / 32.0f; // low-pass filter damping factor for filtered errors
+    float freq_error_filtered = 0;
+    float phase_error_filtered = 0;
 
-    /* PLL controller parameters */
-    const size_t tick_error_average_count_pll = 256; // how many tick_error samples to average PLL samples
-    const float error_damping_factor_pll = 0.125f;
-    const float p_pll = 2.0f * (ocxo_gain / tick_error_average_count_pll) * error_damping_factor_pll;
-    const float i_pll = (ocxo_gain / tick_error_average_count_pll) * error_damping_factor_pll * error_damping_factor_pll;
-
-    // Frequency and phase error integrals grow slowly, but can be large in value.
-    // Single precision floating points do not have enough accuracy for long time scales.
-    // Keep integrals as value = coarse + fine, and accumulate using Kahan-Babushka summation
+    /**
+     * Frequency and phase error integrals
+     * The integrals grow slowly, but can end up being large in value.
+     * Single precision floating points do not have enough accuracy for long time-scales.
+     * The integrals are kept as value = coarse + fine, and accumulated using Kahan-Babushka summation.
+     */
     float freq_error_integral_coarse = 0;
     float freq_error_integral_fine = 0;
     float phase_error_integral_coarse = 0;
     float phase_error_integral_fine = 0;
 
-    /* Filtered frequency and phase errors for UI error display. */
-    float freq_error_filtered = 0;
-    float phase_error_filtered = 0;
-    float alpha = 1 / 8.0f; // low-pass filter damping factor for filtered errors
+    /* FLL controller parameters */
+    const float error_damping_factor_fll = 0.125f;
+    const float i_fll = ocxo_gain * error_damping_factor_fll;
 
-    /* Phase and frequency sample averaging parameters */
-    size_t tick_error_average_count = tick_error_average_count_fll_start;
-    int tick_error_start = 0; // tick error at start of averaging period
-    int tick_error_sum = 0; // accumulated sum of tick error sample values
-    size_t tick_error_count = 0; // accumulated number of tick error samples
-
-    uint8_t state = 0; // 0=FLL, 1=PLL, 2=Free running
-    uint32_t state_count = 0; // time to transition to next state
-
-    int64_t tick_offset = 0; // tick offset to adjust initial tick error to 0
-    bool tick_offset_initialized = false; // has the tick offset been initialized
+    /* PLL controller parameters */
+    const float r = alpha / 3.0f; // system matrix eigenvalue
+    const float p_pll = 8.0f * ocxo_gain * r / (9.0f * tick_error_average_count_pll);
+    const float i_pll = ocxo_gain * r * r / (3.0f * tick_error_average_count_pll);
 
 
     // make sure OCXO is at known state
-    ui_ocxo_control_word = -8192;
+    ui_ocxo_control_word = 0;
     i2c_master_transfer(0x0c, &ui_ocxo_control_word, sizeof(ui_ocxo_control_word));
 
     while(1) {
@@ -561,8 +591,8 @@ int main() {
         ui_tick_valid = tick_pps;
 
 #if (FUNCONF_USE_DEBUGPRINTF)
-        const int freq_err_scale = ui_frequency_error_raw * 1000LL / 16777216LL;
-        const int phase_err_scale = ui_phase_error_raw * 1000LL / 16777216LL;
+        const int freq_err_scale = freq_error_filtered * 1000.0f;
+        const int phase_err_scale = phase_error_filtered * 1000.0f;
 
         printf("%d, %lu, %d, %d, %d, %d, %d\n", state, timestamp, (int)tick_error_count, (int)freq_err_scale, (int)tick_error, (int)phase_err_scale, (int)ui_ocxo_control_word);
 #endif
@@ -579,16 +609,17 @@ int main() {
          * Compute phase error estimate from averaged tick error
          */
 
+        // Compute the average tick error over the averaging period
         const float tick_error_average = (float)tick_error_sum / (float)tick_error_average_count;
-        const float freq_error = (tick_error - tick_error_start) / (float)tick_error_average_count;
+        // Estimate the phase error from the average tick error
         const float phase_error = estimate_phase_error(tick_error_average);
+        // Estimate frequency error from the drift of the phase
+        const float freq_error = (phase_error - phase_error_start) / (float)tick_error_average_count;
 
         freq_error_filtered += alpha * (freq_error - freq_error_filtered);
         phase_error_filtered += alpha * (phase_error - phase_error_filtered);
 
         float control = 0.0f;
-
-        state_count++;
 
         if (state == 0) {
             // Compute freq_error_integral += freq_err
@@ -596,15 +627,28 @@ int main() {
 
             control = i_fll * freq_error_integral_coarse;
 
-            if (tick_error - tick_error_start >= -2 && tick_error - tick_error_start <= 2) {
+            /*
+             * Check if we want to adjust the averaging period
+             */
+            if (phase_error - phase_error_start > -0.25f && phase_error - phase_error_start < 0.25f) {
                 // increase averaging time for next cycle to improve resolution
                 tick_error_average_count *= 2;
             }
 
+            if (phase_error - phase_error_start < -1.0f || phase_error - phase_error_start > 1.0f) {
+                if (tick_error_average_count > tick_error_average_count_fll_start) {
+                    // decrease averaging time for next cycle to improve speed
+                    tick_error_average_count /= 2;
+                }
+            }
+
+
+            /*
+             * Check if it's time to switch to PLL
+             */
             if (tick_error_average_count > tick_error_average_count_fll_end) {
                 // switch to PLL
                 state = 1;
-                state_count = 0;
 
                 // switch to PLL averaging
                 tick_error_average_count = tick_error_average_count_pll;
@@ -612,18 +656,21 @@ int main() {
                 // reset tick error to zero
                 tick_offset = tick_pps_absolute - tick_pps;
 
+                // reset phase error to correspond with constant zero tick error
+                phase_error_filtered = -0.5f;
+
                 // seamless hand over to PLL
-                phase_error_integral_coarse = control / i_pll;
-                phase_error_integral_fine = freq_error_integral_fine * i_fll / i_pll;
+                phase_error_integral_coarse = (control - p_pll * phase_error_filtered) / i_pll;
+                phase_error_integral_fine = 0.0f;
             }
         } else if (state == 1) {
             // Compute phase_error_integral += phase_error
             kahan_babushka_sum(&phase_error_integral_coarse, &phase_error_integral_fine, phase_error);
 
-            control = p_pll * phase_error + i_pll * phase_error_integral_coarse;
+            control = p_pll * phase_error_filtered + i_pll * phase_error_integral_coarse;
         } else if (state == 2) {
             // free running, no control
-            control = -8192.0f;
+            control = ui_ocxo_control_word;
         }
 
         if (control > 32767.0f) {
@@ -636,10 +683,13 @@ int main() {
         // get ready to accumulate next period
         tick_error_sum = 0;
         tick_error_count = 0;
-        tick_error_start = tick_error;
+        phase_error_start = phase_error;
 
         const int16_t ocxo_control_word = control;
 
+        /*
+         * Update monitoring data for UI
+         */
         i2c_acquire(); // don't allow i2c accesses while we update the following data
 
         ui_frequency_error_raw = freq_error * 16777216.0f;
@@ -652,6 +702,9 @@ int main() {
         ui_control_mode = state;
         i2c_release();
 
+        /*
+         * Update absolute tick value of the next PPS output pulse.
+         */
         __disable_irq();
         next_pps_out_tick = tick_pps_absolute - tick_offset + 20000000;
         __enable_irq();
