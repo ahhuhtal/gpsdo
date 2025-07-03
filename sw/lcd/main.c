@@ -178,6 +178,22 @@ void set_pos_hd44780(uint8_t pos) {
 }
 
 /**
+ * Write character data to CGRAM
+ * @param ch character code
+ * @param data character bitmap data
+ */
+void write_cgram_char_hd44780(uint8_t ch, uint8_t data[8]) {
+    // write the character data
+    for (int i = 0; i < 8; i++) {
+        // set CGRAM address
+        send_hd44780_command(0x40 | (ch << 3) | i);
+        Delay_Us(100);
+        send_hd44780_data(data[i]);
+        Delay_Us(100);
+    }
+}
+
+/**
  * Output a character to the HD44780 display
  * @param ch character to send
  * @return the character which was output
@@ -326,6 +342,25 @@ int main() {
 
     uint32_t error_count = 0;
 
+    // history is shown as a graph using 8 characters on the display
+    // each day is split into 5 time intervals, one pixel column per interval
+    // for each interval, the minimum and maximum OCXO control word is stored
+    // for ease of use, each character represents a single day of history
+
+    const unsigned int control_history_length_seconds = 17280; // 4.8 hours of history
+
+    enum { N_history = 40 }; // number of history intervals
+    int16_t control_history_min[N_history];
+    int16_t control_history_max[N_history];
+
+    for (unsigned int i = 0; i < N_history; i++) {
+        control_history_min[i] = 32767;
+        control_history_max[i] = -32768;
+    }
+
+    // time at which to switch to the next history interval
+    uint32_t control_history_interval_switch_timestamp = 0;
+
     while(1) {
         // fetch data from GNSS interface
         i2c_master_transfer(0x03, &iface_data, sizeof(iface_data));
@@ -416,8 +451,124 @@ int main() {
             // cols 2,3,4,5,6 are for OCXO temperature
             printf_hd44780_right_justified(0x42,5,"%d.%01d", temperature/16, (temperature % 16) * 10 / 16);
 
-            // cols 7,8,9,10,11,12,13,14,15 are for control code
-            printf_hd44780_right_justified(0x4a,6,"%d", pfd_data.ocxo_control_word);
+            if (valid) {
+                // update the OCXO control history
+                if (iface_data.timestamp >= control_history_interval_switch_timestamp) {
+                    // switch to next history interval
+                    control_history_interval_switch_timestamp = iface_data.timestamp + control_history_length_seconds;
+
+                    // shift the history
+                    for (int i = N_history - 1; i > 0; i--) {
+                        control_history_min[i] = control_history_min[i - 1];
+                        control_history_max[i] = control_history_max[i - 1];
+                    }
+
+                    control_history_min[0] = 32767;
+                    control_history_max[0] = -32768;
+                }
+
+                if (pfd_data.ocxo_control_word < control_history_min[0]) {
+                    control_history_min[0] = pfd_data.ocxo_control_word;
+                }
+                if (pfd_data.ocxo_control_word > control_history_max[0]) {
+                    control_history_max[0] = pfd_data.ocxo_control_word;
+                }
+            }
+
+            // cols 7,8,9,10,11,12,13,14 are for displaying control history
+            // compute the total maximum and minimum of the control history
+            int16_t control_history_cumulative_max = -32768;
+            int16_t control_history_cumulative_min = 32767;
+
+            for (unsigned int i_history = 0; i_history < N_history; i_history++) {
+                if (control_history_max[i_history] > control_history_cumulative_max) {
+                    control_history_cumulative_max = control_history_max[i_history];
+                }
+
+                if (control_history_min[i_history] < control_history_cumulative_min) {
+                    control_history_cumulative_min = control_history_min[i_history];
+                }
+            }
+
+            // number of pixels on the screen
+            const int pixel_rows = 8;
+
+            // scaling factor from control values to number of pixels on screen
+            // try to fit entire range on screen
+            int history_scale = (control_history_cumulative_max - control_history_cumulative_min + pixel_rows - 1) / pixel_rows;
+
+            // clamp scale to reasonable limits
+            if (history_scale < 1) {
+                history_scale = 1;
+            }
+            if (history_scale > 16) {
+                history_scale = 16;
+            }
+
+            // zero level value (drawn in the middle of the screen)
+            int16_t control_history_display_offset;
+
+            if (control_history_cumulative_max - control_history_cumulative_min <= pixel_rows * history_scale) {
+                // if the history fits the screen, use the average of the min and max
+                control_history_display_offset = (control_history_cumulative_max + control_history_cumulative_min) / 2;
+            } else {
+                // otherwise always fit the minimum on the screen
+                control_history_display_offset = control_history_cumulative_min + pixel_rows * history_scale;
+            }
+
+            // update the display (custom chars 0 - 7)
+            for (unsigned int ch = 0; ch < 8; ch++) {
+                uint8_t custom_char_data[8];
+
+                for (unsigned int row = 0; row < 8; row++) {
+                    custom_char_data[row] = 0;
+                }
+
+                for (unsigned int column = 0; column < 5; column++) {
+                    // 5 intervals per character, one pixel column per interval
+                    unsigned int i_history = ch * 5 + column;
+
+                    int max_pixel = ((pixel_rows * history_scale / 2 - 1) - (control_history_max[i_history] - control_history_display_offset)) / history_scale;
+                    int min_pixel = ((pixel_rows * history_scale / 2 - 1) - (control_history_min[i_history] - control_history_display_offset)) / history_scale;
+
+                    if (max_pixel < 0) {
+                        max_pixel = 0;
+                    }
+                    if (max_pixel > pixel_rows - 1) {
+                        max_pixel = pixel_rows - 1;
+                    }
+                    if (min_pixel < 0) {
+                        min_pixel = 0;
+                    }
+                    if (min_pixel > pixel_rows - 1) {
+                        min_pixel = pixel_rows - 1;
+                    }
+
+                    // min is the bottom of the column, max is the top of the column
+                    // thus the pixel index for min should be larger than the index for max
+                    // draw a line from max to min if they are not reversed.
+                    // don't draw a line if they are reversed.
+                    for (int row = max_pixel; row <= min_pixel; row++) {
+                        custom_char_data[row] |= (1 << column);
+                    }
+
+                    write_cgram_char_hd44780(ch, custom_char_data);
+                }
+            }
+
+            set_pos_hd44780(0x47);
+            // output the custom characters as 7, 6, 5, 4, 3, 2, 1, 0
+            // can't use a string here because we want to print character zero
+            for (int ch = 7; ch >= 0; ch--) {
+                putchar_hd44780(ch);
+            }
+
+            // show the scale on the last column (15)
+            if (history_scale < 10) {
+                putchar_hd44780('0' + history_scale - 1);
+            } else {
+                putchar_hd44780('A' + history_scale - 10);
+            }
         }
 #if FUNCONF_USE_DEBUGPRINTF
         printf("%lu, %d, %d, %d, %d, %d, %d, %d\n", iface_data.timestamp, (int)iface_data.nsat_fix_valid, (int)pfd_data.control_mode, (int)pfd_data.frequecy_error_raw, (int)pfd_data.frequency_error_filtered, (int)pfd_data.phase_error_raw, (int)pfd_data.phase_error_filtered, (int)pfd_data.ocxo_control_word);
